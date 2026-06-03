@@ -1,0 +1,109 @@
+name: Scheduled snapshot
+
+on:
+  schedule:
+    # Every 6 hours (UTC). Classifieds listings don't change minute-to-minute,
+    # and the source is aggressive about blocking scrapers, so a gentler
+    # cadence is both sufficient and safer. Enrichment is per-item cached, so
+    # each run only spends Gemini quota on genuinely new listings.
+    # NOTE: scheduled runs always run in PRODUCTION mode.
+    - cron: '17 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      run_mode:
+        description: "Run mode"
+        type: choice
+        default: test
+        options:
+          - test
+          - production
+
+permissions:
+  contents: write
+
+concurrency:
+  group: snapshot
+  cancel-in-progress: false
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    # Resolve the effective mode once: scheduled runs are always production;
+    # a manual run uses the dropdown (which defaults to "test").
+    env:
+      RUN_MODE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.run_mode || 'production' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Show run mode
+        run: echo "Running in '$RUN_MODE' mode."
+
+      # ── PRODUCTION: full run, writes the real output files ──────────────
+      - name: Run scraper (production)
+        if: ${{ env.RUN_MODE == 'production' }}
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # Optional second key from a DIFFERENT Google Cloud project. If set,
+          # the enricher dispatches batches concurrently across both keys
+          # (roughly 2x throughput). Add as a repo secret named
+          # GEMINI_API_KEY_2; leave unset for single-key mode.
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          PYTHONUNBUFFERED: "1"
+        run: python scrape.py
+
+      # ── TEST: one batch end-to-end, writes only *_test files ───────────
+      # Caps work at TEST_MODE_ITEM_LIMIT (one batch) and writes to the
+      # gitignored *_test outputs, so nothing touches the live dashboard.
+      - name: Run scraper (test — one batch)
+        if: ${{ env.RUN_MODE == 'test' }}
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          PYTHONUNBUFFERED: "1"
+        run: python scrape.py --test
+
+      # Make the test results downloadable from the run's "Artifacts" section
+      # so you can eyeball one fully-enriched batch before going to production.
+      - name: Upload test outputs
+        if: ${{ env.RUN_MODE == 'test' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output
+          path: |
+            items_test.csv
+            raw_items_test.json
+            docs/data/items_test.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      # ── Commit (production only) ───────────────────────────────────────
+      - name: Commit and push results
+        if: ${{ env.RUN_MODE == 'production' }}
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add raw_items.json items.csv docs/data/items.json
+          if git diff --cached --quiet; then
+            echo "No data changes to commit."
+          else
+            git commit -m "Snapshot $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push
+          fi
