@@ -1,0 +1,24 @@
+# Secrets — never commit
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test-mode outputs (production raw_items.json / items.csv / docs/data/items.json
+# are NOT ignored — the GitHub Actions workflow needs to commit them)
+raw_items_test.json
+items_test.csv
+items_test.json
+docs/data/items_test.json
