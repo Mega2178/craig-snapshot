@@ -31,14 +31,27 @@ consumed by a static frontend in `docs/`, served via GitHub Pages.
 
 ## How scoring works
 
-For each listing the model estimates the item's real retail value (independent
-of the asking price), a resale percentage, a sales-velocity tier, a condition
-tier, and a confidence level. From those:
+For each listing the model first classifies it (`single_item`, `multi_item`,
+or `not_for_sale`) and grounds the price — because a classifieds "price" is
+often a placeholder ("$5, make offer on anything"), an aggregate over a bundle,
+or attached to an ad that isn't selling one item. For a bundle it values the
+single most valuable item shown. It returns an `effective_price_usd` (the real
+cash cost of the item it valued, or 0 if it genuinely can't tell) and a
+`price_is_placeholder` flag. Then it estimates the item's real retail value
+(independent of the asking price), a resale percentage, a sales-velocity tier,
+a condition tier, and a confidence level. From those:
 
-- **purchase price** = asking price × `NEGOTIATION_FACTOR` (assumes light
-  haggling; no buyer's premium or tax on a private sale).
+- **cost basis** = the model's `effective_price_usd` when available; otherwise
+  the scraped headline price, but only for a trustworthy `single_item` (never
+  for a bundle, a placeholder, or a not-for-sale ad). When no price can be
+  trusted, the listing is left **unscored** so it can't produce a fake deal —
+  it still shows under "Newest" with a *bundle* / *price?* badge. The
+  `cost_basis` column in the CSV records which path was used.
+- **purchase price** = cost basis × `NEGOTIATION_FACTOR` (light haggling; no
+  buyer's premium or tax on a private sale).
 - **effective resale** = estimated resale × a condition factor (full for
-  new/open-box, a small haircut for an easy fix, zero for broken/unsellable).
+  new/open-box, a small haircut for an easy fix, zero for broken/unsellable or
+  not-for-sale).
 - **ROI (flip score)** = (effective resale − purchase price − pickup hassle) ÷
   purchase price.
 - **gross profit** = effective resale − purchase price − pickup hassle.
@@ -75,6 +88,14 @@ To preview the dashboard locally, serve the `docs/` directory and open it:
 `.github/workflows/scrape.yml` runs the full pipeline on a schedule and commits
 the output back to the default branch. Scheduled runs are always in
 **production** mode.
+
+The scraper writes its outputs after every enrichment batch, atomically, and
+the production commit step runs even if the run is **cancelled early or fails**
+partway — so whatever finished is committed rather than lost. Because each run
+loads the already-committed data first and only adds to it, a partial commit
+can only extend the dataset, never blank or shrink it. (If you'd rather only
+commit on a clean finish, change the commit step's `if:` from
+`always() && ...` to `(success() || cancelled()) && ...`.)
 
 The workflow needs a repo secret named `GEMINI_API_KEY`. An optional second
 secret `GEMINI_API_KEY_2` (from a **different** Google Cloud project) roughly

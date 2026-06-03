@@ -76,6 +76,16 @@
     damaged_hard_fix:  "hard fix",
   };
 
+  // Mirrors _PLACEHOLDER_PRICES in scrape.py: obvious teaser/sequential prices
+  // we won't trust as a real cost when the model gave no effective price.
+  const PLACEHOLDER_PRICES = new Set([
+    1, 11, 111, 1111, 11111, 111111,
+    12, 123, 1234, 12345, 123456, 1234567,
+    321, 4321, 54321,
+    1212, 1010,
+    9999, 99999, 999999,
+  ]);
+
   // ---- DOM refs ---------------------------------------------------
   const grid           = document.getElementById("grid");
   const sortSel        = document.getElementById("sort");
@@ -311,17 +321,51 @@
     if (s === "" || s === null || s === undefined) return NaN;
     return num(String(s).replace(/[^0-9.]/g, ""));
   }
-  // Seller's asking price. Prefer the parsed numeric, fall back to the raw string.
+  // Seller's headline asking price. Prefer the parsed numeric, fall back to raw.
   function priceNum(item) {
     if (typeof item.price_value === "number" && item.price_value > 0) {
       return item.price_value;
     }
     return dollarsToNum(item.price);
   }
-  // Realistic out-of-pocket cost: asking price × NEGOTIATION_FACTOR.
+
+  // Cost BASIS — mirrors _cost_basis() in scrape.py. Returns the realistic cash
+  // cost to buy the one item that was valued, or NaN when the price can't be
+  // trusted (bundle without a per-item price, "make offer", placeholder, or a
+  // not-for-sale listing) — those become unscoreable and sink, exactly as on
+  // the backend. KEEP THIS IN LOCKSTEP WITH scrape.py.
+  function costBasisNum(item) {
+    if (item._costBasis !== undefined) return item._costBasis;
+    let cost = NaN;
+    const kind = (item.ai_listing_kind || "single_item").trim().toLowerCase();
+    if (kind === "not_for_sale") {
+      item._costBasis = NaN;
+      return NaN;
+    }
+    const eff = num(item.ai_effective_price);
+    if (!isNaN(eff) && eff > 0) {
+      cost = eff;
+    } else {
+      const placeholder =
+        String(item.ai_price_is_placeholder || "").trim().toLowerCase() === "yes";
+      if (kind === "single_item" && !placeholder) {
+        const listed = priceNum(item);
+        if (!isNaN(listed) && listed > 0 && !PLACEHOLDER_PRICES.has(Math.trunc(listed))) {
+          cost = listed;
+        } else {
+          const raw = String(item.price || "").trim();
+          if (raw === "$0" || raw === "$0.00" || raw === "0") cost = 0;
+        }
+      }
+    }
+    item._costBasis = cost;
+    return cost;
+  }
+
+  // Realistic out-of-pocket cost: cost basis × NEGOTIATION_FACTOR.
   function purchasePriceNum(item) {
-    const n = priceNum(item);
-    return isNaN(n) ? NaN : n * NEGOTIATION_FACTOR;
+    const c = costBasisNum(item);
+    return isNaN(c) ? NaN : c * NEGOTIATION_FACTOR;
   }
 
   // ─── Posted-time helpers ────────────────────────────────────────
@@ -641,7 +685,7 @@
       scoreEl.title =
         `ROI: ${f.toFixed(2)}× — ` +
         `(effective resale − cost − $${HASSLE.toFixed(0)} hassle) ÷ cost. ` +
-        `Cost = asking price × ${NEGOTIATION_FACTOR.toFixed(2)}. ` +
+        `Cost = effective item price × ${NEGOTIATION_FACTOR.toFixed(2)}. ` +
         `Effective resale = est. resale × condition factor.`;
     }
 
@@ -689,16 +733,56 @@
       }
     }
 
+    // Listing-kind / price-clarity flag badge.
+    const kind = (item.ai_listing_kind || "single_item").trim().toLowerCase();
+    const costUnknown = isNaN(costBasisNum(item));
+    const flagEl = node.querySelector('[data-role="listing-flag"]');
+    if (flagEl) {
+      if (kind === "multi_item") {
+        flagEl.textContent = "bundle";
+        flagEl.setAttribute("data-flag", "bundle");
+        flagEl.title = "Multi-item listing — the figures describe one item from it"
+          + (item.ai_product ? `: ${item.ai_product}` : "");
+      } else if (kind === "not_for_sale") {
+        flagEl.textContent = "not for sale";
+        flagEl.setAttribute("data-flag", "not-for-sale");
+        flagEl.title = "Not a single item for sale (wanted ad, garage sale, found item, etc.)";
+      } else if (costUnknown) {
+        flagEl.textContent = "price?";
+        flagEl.setAttribute("data-flag", "price");
+        flagEl.title = "Asking price looks like a placeholder or make-offer — open the listing for the real price";
+      } else {
+        flagEl.textContent = "";
+      }
+    }
+
     // Title
     node.querySelector('[data-role="title"]').textContent = item.title || "(untitled)";
+
+    // Valued-item subtitle: for bundles, say which single item the numbers describe.
+    const subEl = node.querySelector('[data-role="valued-item"]');
+    if (subEl) {
+      if (kind === "multi_item" && item.ai_product) {
+        subEl.textContent = `figures for: ${item.ai_product}`;
+        subEl.hidden = false;
+      } else {
+        subEl.hidden = true;
+      }
+    }
 
     // Stats: asking price, purchase cost (×0.9), resale, retail
     node.querySelector('[data-role="price"]').textContent = item.price || "—";
     const costEl = node.querySelector('[data-role="purchase-price"]');
     if (costEl) {
       const cost = purchasePriceNum(item);
-      costEl.textContent = isNaN(cost) ? "—" : "$" + cost.toFixed(2);
-      costEl.title = "Realistic out-of-pocket: asking price × 0.9 (light haggling)";
+      if (isNaN(cost)) {
+        // Price can't be trusted (placeholder / make-offer / bundle / not for sale).
+        costEl.textContent = kind === "not_for_sale" ? "—" : "see listing";
+        costEl.title = "No reliable acquisition price — check the listing";
+      } else {
+        costEl.textContent = "$" + cost.toFixed(2);
+        costEl.title = "Realistic out-of-pocket: effective item price × 0.9 (light haggling)";
+      }
     }
     const resale = num(item.ai_estimated_resale);
     node.querySelector('[data-role="resale"]').textContent =

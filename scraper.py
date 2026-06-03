@@ -78,8 +78,13 @@ class Item:
     ai_confidence: str = ""
     ai_condition: str = ""        # new/open_box/damaged_easy_fix/damaged_hard_fix
     ai_sales_velocity: str = ""    # hot/normal/slow/very_slow/unknown
+    ai_product: str = ""           # what the model decided this (one) item is
+    ai_listing_kind: str = ""      # single_item/multi_item/not_for_sale
+    ai_price_is_placeholder: str = ""  # "yes" if headline price is a teaser/aggregate
+    ai_effective_price: str = ""   # model's realistic cash price for the valued item ("" = unknown)
     value_overridden: str = ""     # "yes" if we forced resale to $0
     ai_notes: str = ""
+    cost_basis: str = ""           # where the scored cost came from: ai_effective/listed/free/unknown/not_for_sale
     flip_score: str = ""  # (effective_resale - purchase_price - hassle) / purchase_price
     gross_profit: str = ""  # effective_resale - purchase_price - hassle (in dollars)
     scraped_at: str = ""   # last time this run touched the item

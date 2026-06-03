@@ -376,6 +376,21 @@ html, body {
 }
 .badge--confidence:empty { display: none; }
 
+/* Listing-kind / price-clarity flag (bundle / not for sale / price?) */
+.badge--flag {
+  background: #fbf1e6;
+  color: #92400e;
+  border: 1px solid #ecd9c2;
+  font-weight: 600;
+  text-transform: lowercase;
+}
+.badge--flag:empty { display: none; }
+.badge--flag[data-flag="price"] {
+  background: #fdeaea;
+  color: #9b2c2c;
+  border-color: #f3cccc;
+}
+
 .card-title {
   margin: 0;
   font-size: 14px;
@@ -388,6 +403,15 @@ html, body {
   -webkit-box-orient: vertical;
   overflow: hidden;
 }
+
+.card-subtitle {
+  margin: 2px 0 0;
+  font-size: 12px;
+  font-style: italic;
+  color: var(--ink-muted);
+  line-height: 1.3;
+}
+.card-subtitle[hidden] { display: none; }
 
 .card-stats {
   margin: 4px 0 0;

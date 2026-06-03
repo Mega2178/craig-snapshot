@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import sys
 import time
 from dataclasses import asdict
@@ -64,13 +65,18 @@ CSV_FIELDS = [
     "flip_score",            # ROI: most important — sorted by this
     "gross_profit",          # absolute $ profit
     "price",                 # seller's asking price (raw, e.g. "$1,600")
+    "ai_effective_price",    # model's realistic cash price for the valued item
+    "cost_basis",            # where cost came from: ai_effective/listed/free/unknown/not_for_sale
     "ai_estimated_resale",
     "ai_retail_estimate",
     "ai_resale_pct",
     "ai_confidence",
     "ai_sales_velocity",     # hot / normal / slow / very_slow / unknown
     "ai_condition",          # new / open_box / damaged_easy_fix / damaged_hard_fix
-    "value_overridden",      # "yes" if we forced resale to $0 (damaged_hard_fix)
+    "ai_listing_kind",       # single_item / multi_item / not_for_sale
+    "ai_price_is_placeholder",  # "yes" if headline price is a teaser/aggregate
+    "value_overridden",      # "yes" if we forced resale to $0 (damaged_hard_fix / not_for_sale)
+    "ai_product",            # the one item the model actually valued
     "title",
     "location",              # neighborhood / city the seller entered
     "ai_notes",
@@ -108,13 +114,28 @@ def load_existing() -> dict[str, Item]:
         return {}
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write text to `path` atomically: write a temp file in the same dir, then
+    os.replace() it into place. os.replace is atomic on POSIX and Windows, so a
+    reader (or a SIGKILL during a cancelled CI run) never sees a half-written
+    file — the committed file is always either the old or the new complete copy.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 def save_raw(items: dict[str, Item]) -> None:
-    with RAW_PATH.open("w", encoding="utf-8") as f:
-        if config.PRETTY_PRINT_JSON:
-            json.dump([asdict(it) for it in items.values()], f, indent=2)
-        else:
-            json.dump([asdict(it) for it in items.values()], f,
-                      separators=(",", ":"))
+    if config.PRETTY_PRINT_JSON:
+        text = json.dumps([asdict(it) for it in items.values()], indent=2)
+    else:
+        text = json.dumps([asdict(it) for it in items.values()],
+                          separators=(",", ":"))
+    _atomic_write_text(RAW_PATH, text)
 
 
 def _sort_key(it: Item):
@@ -126,18 +147,30 @@ def _sort_key(it: Item):
         return (1, 0)
 
 
+def _row_for_output(it: Item) -> dict:
+    """asdict(it) plus any computed-at-write fields, limited to CSV_FIELDS."""
+    row = asdict(it)
+    # cost_basis is computed by scoring; make sure it's present and current even
+    # for items scored before this field existed.
+    if not row.get("cost_basis"):
+        row["cost_basis"] = _cost_basis(it)[1]
+    return {k: row.get(k, "") for k in CSV_FIELDS}
+
+
 def write_csv(items: dict[str, Item]) -> None:
-    """Sort by flip_score desc (unknowns at bottom), write CSV."""
+    """Sort by flip_score desc (unknowns at bottom), write CSV (atomically)."""
     rows = sorted(items.values(), key=_sort_key)
-    with CSV_PATH.open("w", encoding="utf-8", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
-        writer.writeheader()
-        for it in rows:
-            writer.writerow(asdict(it))
+    import io
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=CSV_FIELDS, extrasaction="ignore")
+    writer.writeheader()
+    for it in rows:
+        writer.writerow(_row_for_output(it))
+    _atomic_write_text(CSV_PATH, buf.getvalue())
 
 
 def write_json(items: dict[str, Item]) -> None:
-    """Write items to JSON for the dashboard to consume.
+    """Write items to JSON for the dashboard to consume (atomically).
 
     Format:
         { "generated_at": "<ISO UTC>", "items": [ ...CSV fields... ] }
@@ -145,22 +178,28 @@ def write_json(items: dict[str, Item]) -> None:
     Timestamps stay in raw ISO so the frontend can format them locale-aware.
     """
     rows = sorted(items.values(), key=_sort_key)
-    payload_items = []
-    for it in rows:
-        row = asdict(it)
-        payload_items.append({k: row.get(k, "") for k in CSV_FIELDS})
-
     payload = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "items": payload_items,
+        "items": [_row_for_output(it) for it in rows],
     }
+    if config.PRETTY_PRINT_JSON:
+        text = json.dumps(payload, indent=2)
+    else:
+        text = json.dumps(payload, separators=(",", ":"))
+    _atomic_write_text(JSON_PATH, text)
 
-    JSON_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with JSON_PATH.open("w", encoding="utf-8") as f:
-        if config.PRETTY_PRINT_JSON:
-            json.dump(payload, f, indent=2)
-        else:
-            json.dump(payload, f, separators=(",", ":"))
+
+def flush_outputs(items: dict[str, Item]) -> None:
+    """Persist all three output files (raw cache, CSV, dashboard JSON).
+
+    Called at phase boundaries AND after every enrichment batch, so the
+    committed files always reflect work-so-far. That's what lets a run that is
+    cancelled (or stopped) partway through still push useful, consistent
+    results — combined with atomic writes, the on-disk files are never partial.
+    """
+    save_raw(items)
+    write_csv(items)
+    write_json(items)
 
 
 # ────────────────────────────── pipeline steps ──────────────────────────────
@@ -359,11 +398,17 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
             it.ai_confidence = v.confidence
             it.ai_condition = v.condition
             it.ai_sales_velocity = v.sales_velocity
+            it.ai_product = (v.product_identified or "").strip()
+            it.ai_listing_kind = (v.listing_kind or "").strip().lower()
+            it.ai_price_is_placeholder = "yes" if v.price_is_placeholder else ""
+            it.ai_effective_price = (
+                f"{v.effective_price_usd:.2f}" if v.effective_price_usd > 0 else ""
+            )
 
-            # Force resale to $0 ONLY when the model says "damaged_hard_fix"
-            # (broken/unsellable). Easy-fix items get a small haircut at
-            # scoring time instead.
-            if v.condition == "damaged_hard_fix":
+            # Force resale to $0 (excluded) when the item is broken/unsellable
+            # OR the listing isn't actually a single item for sale. Easy-fix
+            # items get a small haircut at scoring time instead.
+            if v.condition == "damaged_hard_fix" or it.ai_listing_kind == "not_for_sale":
                 estimated_resale = 0.0
                 it.value_overridden = "yes"
             else:
@@ -372,6 +417,7 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
             it.ai_estimated_resale = f"{estimated_resale:.2f}"
             it.ai_notes = f"[{v.product_identified}] {v.notes}".strip()
             it.enriched_at = now_iso
+            it.cost_basis = _cost_basis(it)[1]
             it.flip_score = compute_flip_score(it)
             it.gross_profit = compute_gross_profit(it)
 
@@ -388,8 +434,11 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
                 print(f"  ✓ batch {idx + 1}/{len(batches)} done, "
                       f"{len(valuations)} valuations "
                       f"[{completed}/{len(batches)} complete]")
+            # Flush ALL outputs after every batch (not just the raw cache), so
+            # if the run is cancelled/stopped here, the committed dashboard JSON
+            # and CSV already reflect the work done so far.
             with save_lock:
-                save_raw(items)
+                flush_outputs(items)
     except QuotaExhausted as e:
         print(f"\n⛔ {e}")
         quota_hit = True
@@ -404,25 +453,85 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
 
 # ────────────────────────────── scoring ─────────────────────────────────────
 
-def _purchase_price(it: Item) -> float | None:
-    """Realistic out-of-pocket cost to acquire this item.
+# Asking prices that are almost never a real price on classifieds — sequential
+# runs, repeated digits, all-nines. These are placeholders sellers type to make
+# an ad post. Used ONLY as a backstop: we refuse to fall back to the scraped
+# headline price when it's one of these AND the model gave us no real price. We
+# deliberately exclude small plausible prices (5, 10, 20…) so a genuine cheap
+# item isn't dropped — those are handled by the model's effective price instead.
+_PLACEHOLDER_PRICES = {
+    1, 11, 111, 1111, 11111, 111111,
+    12, 123, 1234, 12345, 123456, 1234567,
+    321, 4321, 54321,
+    1212, 1010,
+    9999, 99999, 999999,
+}
 
-    asking_price * NEGOTIATION_FACTOR (no buyer's premium / tax on a private
-    sale). Free items (price 0) cost ~0 and are allowed through with a $0 cost.
-    Returns None only when we can't determine a price at all (e.g. the listing
-    hasn't been detail-fetched and had no price on the results card yet).
-    """
-    val = it.price_value
-    if not val:
-        # Try to parse from the raw price string as a fallback.
-        raw = (it.price or "").replace("$", "").replace(",", "").strip()
-        try:
-            val = float(raw)
-        except ValueError:
-            return None
-    if val < 0:
+
+def _to_float(s) -> float | None:
+    try:
+        v = float(str(s).replace("$", "").replace(",", "").strip())
+        return v
+    except (ValueError, TypeError, AttributeError):
         return None
-    return val * config.NEGOTIATION_FACTOR
+
+
+def _is_yes(s) -> bool:
+    return str(s or "").strip().lower() in ("yes", "true", "1")
+
+
+def _cost_basis(it: Item) -> tuple[float | None, str]:
+    """Decide the realistic cash cost to acquire the ONE item we valued.
+
+    Returns (cost_usd, basis_label). cost is None when the price can't be
+    trusted, which makes the item unscoreable (no flip score → it sinks instead
+    of producing a fake deal). Priority:
+
+      1. not_for_sale listing                 → (None, "not_for_sale")
+      2. model gave an effective price > 0    → use it           ("ai_effective")
+      3. single_item, NOT placeholder,
+         real headline price (not a teaser)   → use the headline ("listed")
+      4. genuine free single item ("$0")      → (0.0, "free")
+      5. anything else (bundle w/o per-item
+         price, "make offer", placeholder)    → (None, "unknown")
+
+    Note: the scraped headline can only ever be used for a single_item — a
+    bundle's one price is never trusted to represent the item we valued.
+    """
+    kind = (it.ai_listing_kind or "single_item").strip().lower()
+    if kind == "not_for_sale":
+        return None, "not_for_sale"
+
+    eff = _to_float(it.ai_effective_price)
+    if eff is not None and eff > 0:
+        return eff, "ai_effective"
+
+    placeholder = _is_yes(it.ai_price_is_placeholder)
+    if kind == "single_item" and not placeholder:
+        listed = it.price_value if it.price_value else _to_float(it.price)
+        if listed is not None and listed > 0 and int(listed) not in _PLACEHOLDER_PRICES:
+            return listed, "listed"
+        # Genuine free item: an explicit $0 (the detail page / JSON-LD fills
+        # "$0" for free listings). A free valuable item is a great flip.
+        if (it.price or "").strip() in ("$0", "$0.00", "0"):
+            return 0.0, "free"
+
+    return None, "unknown"
+
+
+def _purchase_price(it: Item) -> float | None:
+    """Realistic out-of-pocket cost: cost basis * NEGOTIATION_FACTOR.
+
+    The cost basis (see _cost_basis) is the model's per-item effective price
+    when available, else the scraped headline price only for a trustworthy
+    single-item listing, else None. Returns None when unscoreable.
+    """
+    cost, _basis = _cost_basis(it)
+    if cost is None:
+        return None
+    if cost < 0:
+        return None
+    return cost * config.NEGOTIATION_FACTOR
 
 
 def _condition_resale_factor(it: Item) -> float:
@@ -490,13 +599,15 @@ def compute_gross_profit(it: Item) -> str:
 
 
 def recompute_all_flip_scores(items: dict[str, Item]) -> None:
-    """Recompute flip_score AND gross_profit for every enriched item.
+    """Recompute flip_score, gross_profit, and cost_basis for every enriched item.
 
     Prices can change between runs (sellers drop them), so re-score on each run.
+    Also refreshes cost_basis so items enriched before that field existed get it.
     """
     for it in items.values():
         if not it.ai_confidence or it.ai_confidence == "unknown":
             continue
+        it.cost_basis = _cost_basis(it)[1]
         it.flip_score = compute_flip_score(it)
         it.gross_profit = compute_gross_profit(it)
 
@@ -547,22 +658,22 @@ def main():
     if not only_enrich:
         _t0 = time.time()
         items = do_scrape(items, limit=limit)
-        save_raw(items)
+        # Flush all outputs after the scrape phase, so even a run cancelled
+        # before/early in enrichment still commits the freshly-scraped items.
+        recompute_all_flip_scores(items)
+        flush_outputs(items)
         scrape_secs = time.time() - _t0
         print(f"  scrape phase took {_fmt_duration(scrape_secs)}")
 
     if not only_scrape:
         _t0 = time.time()
         items = do_enrich(items, limit=limit)
-        save_raw(items)
         enrich_secs = time.time() - _t0
         print(f"  enrich phase took {_fmt_duration(enrich_secs)}")
 
-    # always recompute flip scores at end (prices may have refreshed)
+    # always recompute flip scores + cost basis at end (prices may have refreshed)
     recompute_all_flip_scores(items)
-    save_raw(items)
-    write_csv(items)
-    write_json(items)
+    flush_outputs(items)
 
     # summary
     enriched = sum(1 for it in items.values() if it.ai_confidence)
