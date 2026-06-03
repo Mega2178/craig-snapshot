@@ -170,7 +170,7 @@ IMAGE_MEDIA_RESOLUTION = "low"
 # 0.9 assumes you talk them down ~10% on average. There is no buyer's premium
 # or sales tax on a private-party sale, so there's no markup multiplier here.
 # Set to 1.0 to score against full asking price.
-NEGOTIATION_FACTOR = 0.9
+NEGOTIATION_FACTOR = 1.0
 
 # Pickup hassle fudge factor (dollars subtracted when computing flip score).
 # Set a little higher than an auction tool would: classifieds pickups mean
