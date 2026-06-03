@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Market Snapshot</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="site-header">
+    <div class="header-row">
+      <h1>Market Snapshot</h1>
+      <div id="freshness" class="freshness freshness--unknown" aria-live="polite">
+        <span class="freshness-dot"></span>
+        <span id="freshness-text">Loading…</span>
+      </div>
+    </div>
+
+    <!-- Search bar -->
+    <div class="search-row">
+      <label class="search">
+        <span class="search-icon" aria-hidden="true">⌕</span>
+        <input
+          id="search"
+          type="search"
+          placeholder="Search title, notes, category…"
+          autocomplete="off"
+          spellcheck="false"
+          aria-label="Search items"
+        >
+        <button id="search-clear" type="button" class="search-clear" aria-label="Clear search" hidden>×</button>
+      </label>
+    </div>
+
+    <div class="controls">
+      <label class="control">
+        <span class="control-label">Sort</span>
+        <select id="sort">
+          <option value="smart">Smart score (ROI × profit × velocity)</option>
+          <option value="flip_score">ROI / flip score (high → low)</option>
+          <option value="gross_profit">Gross profit (high → low)</option>
+          <option value="price">Asking price (low → high)</option>
+          <option value="newest">Newest first</option>
+          <option value="title">Title (A → Z)</option>
+        </select>
+      </label>
+
+      <label class="control">
+        <span class="control-label">Velocity</span>
+        <select id="velocity">
+          <option value="any">Any</option>
+          <option value="hot">Hot only</option>
+          <option value="hot_or_normal">Hot or normal</option>
+          <option value="exclude_very_slow">Exclude very slow</option>
+        </select>
+      </label>
+
+      <label class="control">
+        <span class="control-label">Condition</span>
+        <select id="condition">
+          <option value="any">Any</option>
+          <option value="new">New only</option>
+          <option value="new_or_open_box">New or open box</option>
+          <option value="exclude_hard_fix">Exclude hard fix</option>
+        </select>
+      </label>
+
+      <label class="control">
+        <span class="control-label">
+          Min ROI: <span id="min-flip-value">0.5</span>×
+        </span>
+        <input id="min-flip" type="range" min="0" max="3" step="0.1" value="0.5">
+      </label>
+
+      <div class="control-meta" id="result-count" aria-live="polite"></div>
+    </div>
+  </header>
+
+  <main id="grid" class="grid" aria-busy="true"></main>
+
+  <div id="load-more-wrap" class="load-more-wrap" hidden>
+    <button id="load-more" type="button" class="load-more-btn">Load more</button>
+    <span id="load-more-info" class="load-more-info"></span>
+  </div>
+
+  <template id="card-template">
+    <article class="card" tabindex="0" role="link">
+      <div class="card-image">
+        <img alt="" loading="lazy" referrerpolicy="no-referrer">
+        <div class="card-image-fallback" aria-hidden="true">no image</div>
+      </div>
+      <div class="card-body">
+        <div class="card-top">
+          <span class="badge badge--score" data-role="flip-score">—</span>
+          <span class="badge badge--profit" data-role="gross-profit"></span>
+          <span class="badge badge--velocity" data-role="velocity"></span>
+          <span class="badge badge--condition" data-role="condition"></span>
+          <span class="badge badge--confidence" data-role="confidence"></span>
+        </div>
+        <h2 class="card-title" data-role="title"></h2>
+        <dl class="card-stats">
+          <div><dt>Price</dt><dd data-role="price"></dd></div>
+          <div><dt>Cost (×0.9)</dt><dd data-role="purchase-price"></dd></div>
+          <div><dt>Resale est.</dt><dd data-role="resale"></dd></div>
+          <div><dt>Retail est.</dt><dd data-role="retail"></dd></div>
+        </dl>
+        <div class="card-footer">
+          <span data-role="posted"></span>
+          <span class="card-category" data-role="category"></span>
+        </div>
+        <div class="card-location" data-role="location"></div>
+      </div>
+    </article>
+  </template>
+
+  <script src="app.js"></script>
+</body>
+</html>
