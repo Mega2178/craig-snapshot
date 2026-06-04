@@ -303,11 +303,8 @@ def crawl_all(session: Session) -> Iterator[Item]:
     printed = 0
 
     for path in config.SEARCH_PATHS:
-        page_size = None  # detected from page 1, used to compute offsets
         for page in range(config.MAX_PAGES_PER_SEARCH):
-            offset = 0 if page == 0 else (page_size or 0) * page
-            if page > 0 and not page_size:
-                break  # couldn't detect a page size; don't guess
+            offset = config.PAGE_OFFSET_STEP * page
             url = build_search_url(path, offset)
             print(f"  fetching {url}")
             try:
@@ -317,8 +314,6 @@ def crawl_all(session: Session) -> Iterator[Item]:
                 break
 
             page_items = parse_search_results(html, path)
-            if page == 0:
-                page_size = len(page_items) or None
             if not page_items:
                 break
 

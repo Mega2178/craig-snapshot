@@ -346,6 +346,8 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
     def _ready(it: Item) -> bool:
         if it.ai_confidence:
             return False
+        if _too_old(it):
+            return False  # don't spend a call on a stale post we won't score
         if config.SCRAPE_ITEM_DETAIL_PAGES and not it.description_enriched:
             return False
         return True
@@ -355,12 +357,15 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
     if limit is not None and len(pending) > limit:
         print(f"  (test mode: capping enrichment at {limit} of {len(pending)} pending)")
         pending = pending[:limit]
+    too_old = sum(1 for it in items.values() if (not it.ai_confidence) and _too_old(it))
     waiting = sum(1 for it in items.values()
                   if (not it.ai_confidence)
+                  and not _too_old(it)
                   and config.SCRAPE_ITEM_DETAIL_PAGES
                   and not it.description_enriched)
     print(f"{len(pending)} items need AI enrichment"
-          + (f" ({waiting} more await a detail page on a later run)" if waiting else ""))
+          + (f" ({waiting} more await a detail page on a later run)" if waiting else "")
+          + (f" ({too_old} skipped as older than {config.MAX_LISTING_AGE_DAYS}d)" if too_old else ""))
     if not pending:
         return items
 
@@ -496,6 +501,33 @@ def _is_yes(s) -> bool:
     return str(s or "").strip().lower() in ("yes", "true", "1")
 
 
+def _age_days(it: Item) -> int | None:
+    """Days since the listing was POSTED, or None if the date is missing/unparseable.
+
+    None means "don't know" → callers treat the item as NOT too old (we never
+    filter on missing data). Mirrors costBasisNum's age check in app.js.
+    """
+    raw = (getattr(it, "posted_at", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        d = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - d).days
+
+
+def _too_old(it: Item) -> bool:
+    """True if the listing is older than the configured posted-age cutoff."""
+    cutoff = getattr(config, "MAX_LISTING_AGE_DAYS", 0) or 0
+    if cutoff <= 0:
+        return False
+    age = _age_days(it)
+    return age is not None and age > cutoff
+
+
 def _cost_basis(it: Item) -> tuple[float | None, str]:
     """Decide the realistic cash cost to acquire the ONE item we valued.
 
@@ -518,6 +550,8 @@ def _cost_basis(it: Item) -> tuple[float | None, str]:
     trusted from the field alone — the model must have extracted it.
     """
     kind = (it.ai_listing_kind or "single_item").strip().lower()
+    if _too_old(it):
+        return None, "too_old"
     if kind == "not_for_sale":
         return None, "not_for_sale"
 

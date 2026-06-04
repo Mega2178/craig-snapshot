@@ -153,24 +153,36 @@ still come back short or empty if the source serves a challenge page. That's
 expected; the next run generally recovers, and cached data keeps the dashboard
 populated in between.
 
-By default it pulls the newest ~3,000 listings across all for-sale categories
-(`MAX_PAGES_PER_SEARCH = 9`). Two consequences worth knowing:
+By default it crawls a curated list of profitable for-sale **categories**
+(`SEARCH_PATHS`), each contributing its own newest listings, plus `/search/sss`
+(everything) as a catch-all. Listings cross-posted to two feeds are de-duped.
+A few things worth knowing:
 
-- The **first run on a fresh repo is long** — it has ~3,000 brand-new listings
-  to fetch detail pages for (one request each, ~2s apart), so it can run well
-  over an hour, and it's the run most likely to hit a temporary block. If the
-  detail-fetch time budget is reached, the rest are fetched and enriched on the
-  next scheduled run. Coverage fills in within a day; steady-state runs only
-  detail-fetch the handful of genuinely-new listings, so they're quick.
+- **Volume comes from category breadth, not page depth.** The no-JS results
+  page we parse (to stay block-resistant) only serves the newest ~400 listings
+  *per feed*, and the `?s=` offset re-serves that same set instead of paging
+  deeper — so `MAX_PAGES_PER_SEARCH` is set to `1` and each *category* is scraped
+  separately to multiply the distinct listings. To cover more (or fewer) areas,
+  edit `SEARCH_PATHS`: on the site, click a category and copy the code after
+  `/search/` in the address bar. After a run, check the log — any feed printing
+  `parsed 0 rows` isn't a valid code for your city, so comment it out.
+- **Stale listings are skipped.** `MAX_LISTING_AGE_DAYS` (default 60) means a
+  listing posted longer ago than that is neither enriched nor scored, so the
+  Gemini quota and the dashboard both stay on fresh deals. This is separate from
+  `RETENTION_DAYS` (which counts from when *we* first saw a listing); the age
+  filter keys off the listing's own post date, so a months-old post we just
+  discovered is skipped too. Set it to `0` to disable.
 - Only listings whose detail page (and photo) has been fetched are sent for
   enrichment, so every scored item is photo-backed rather than a title-only
   guess. Items still awaiting a detail page show up once a later run fetches them.
 
-To dial it back: lower `MAX_PAGES_PER_SEARCH` (e.g. 3-4) and/or raise
-`SCRAPE_DELAY_SECONDS`. Both reduce request volume and the chance of a block.
-Note the cumulative dataset grows with volume × `RETENTION_DAYS`; lower
-`RETENTION_DAYS` if you want the dashboard to stay tightly focused on the newest
-listings rather than a month of history.
+The first run after changing `SEARCH_PATHS` re-crawls each category fresh, so it
+fetches more detail pages than a steady-state run and is the one most likely to
+hit a temporary block; if the detail-fetch budget is reached, the rest are
+fetched and enriched next run. To reduce request volume and block risk, trim
+`SEARCH_PATHS` to fewer categories and/or raise `SCRAPE_DELAY_SECONDS`. The
+cumulative dataset grows with volume × `RETENTION_DAYS`; lower `RETENTION_DAYS`
+to keep the dashboard tightly focused on the newest listings.
 
 ## Troubleshooting
 
@@ -186,7 +198,15 @@ and retried on the next run, so nothing is lost meanwhile).
 
 **A scheduled run scraped zero items** — the source likely served a challenge
 page to the runner. Re-run from the Actions tab; raise `SCRAPE_DELAY_SECONDS`
-and keep `MAX_PAGES_PER_SEARCH` low if it persists.
+and trim `SEARCH_PATHS` to fewer categories if it persists.
+
+**A category feed printed `parsed 0 rows`** — that code isn't valid for your
+city (or has no listings right now). Confirm it by clicking the category on the
+site and reading the code after `/search/` in the URL; comment out bad ones.
+
+**Older listings stopped showing up** — that's `MAX_LISTING_AGE_DAYS` (default
+60) hiding posts older than the cutoff from scoring. Raise it or set it to `0`
+in `config.py` to score everything regardless of age.
 
 **Source page HTML changed** — the selectors live in `parse_search_results()`
 and `fetch_item_detail()` in `scraper.py`.

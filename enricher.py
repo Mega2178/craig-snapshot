@@ -131,6 +131,14 @@ A. LISTING_KIND — pick exactly one:
                       identify and value ONLY that one item. Every field below
                       (product_identified, retail, resale, velocity, condition)
                       must describe that one item — NOT the whole pile.
+                      PRICE FOR A BUNDLE: a single price on the whole ad ("all
+                      for $5", a lone "$5", "everything $20") is the price of the
+                      PILE, not of the one item you picked — do NOT put it in
+                      effective_price_usd. Set price_status = "priced" for a
+                      multi_item ONLY when the text gives a price for THAT
+                      specific item ("dresser $40", "doors $50 each", "Queen $90
+                      and up"). If no per-item price is stated for your chosen
+                      item, set price_status = "unknown" (NOT "priced").
    • "not_for_sale" = NOT one item being sold. Includes: wanted/ISO ("looking
                       for", "need", "ISO"), GARAGE / ESTATE / MOVING / YARD SALE
                       announcements (a title like "Garage sale" is ALWAYS

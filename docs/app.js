@@ -58,6 +58,11 @@
   // config.PICKUP_HASSLE_DOLLARS. KEEP THIS IN SYNC WITH config.py.
   const HASSLE = 10.0;
 
+  // Posted-age cutoff: listings older than this many days are left unscored so
+  // the dashboard stays on fresh deals. MUST equal config.MAX_LISTING_AGE_DAYS.
+  // 0 disables. Listings with no parseable date are kept (not filtered).
+  const MAX_LISTING_AGE_DAYS = 60;
+
   // ─── Condition tiers ────────────────────────────────────────────
   // Mirrors _condition_resale_factor() in scrape.py. The factor multiplies
   // estimated_resale: 1.0 for new / open_box (default — no penalty when
@@ -333,8 +338,20 @@
   // trusted (bundle/make-offer/placeholder with no real price, or not_for_sale)
   // — those become unscoreable and sink, exactly as on the backend.
   // KEEP THIS IN LOCKSTEP WITH scrape.py.
+
+  // True when the listing was posted longer ago than MAX_LISTING_AGE_DAYS.
+  // Keys off posted_at ONLY (no first_seen fallback) to match _age_days in
+  // scrape.py; a missing/unparseable date counts as NOT too old.
+  function tooOld(item) {
+    if (!MAX_LISTING_AGE_DAYS) return false;
+    const t = item.posted_at ? Date.parse(item.posted_at) : NaN;
+    if (isNaN(t)) return false;
+    return (Date.now() - t) / 86400000 > MAX_LISTING_AGE_DAYS;
+  }
+
   function costBasisNum(item) {
     if (item._costBasis !== undefined) return item._costBasis;
+    if (tooOld(item)) { item._costBasis = NaN; return NaN; }
     let cost = NaN;
     const kind = (item.ai_listing_kind || "single_item").trim().toLowerCase();
     if (kind === "not_for_sale") { item._costBasis = NaN; return NaN; }

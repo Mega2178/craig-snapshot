@@ -44,33 +44,69 @@ GEMINI_API_KEY_2 = os.getenv("GEMINI_API_KEY_2", "")  # optional fallback
 SITE_SUBDOMAIN = "kansascity"
 
 # Which search result pages to crawl. Each entry is a path on the source site.
-# The default pulls the newest items across ALL for-sale categories, which is
-# what you want for a broad flip hunt.
 #
-# To cut the noise and spend less Gemini quota, narrow to specific categories
-# by replacing the list, e.g.:
-#     SEARCH_PATHS = ["/search/ela", "/search/tla", "/search/sga"]
-# Common category codes:
-#     sss = all for sale        ela = electronics      tla = tools
-#     sga = garage sales        ata = antiques         ppa = appliances
-#     hsa = household           ata = arts+crafts      sna = sporting goods
-#     vga = video gaming        msa = musical instr    bia = bikes
-#     foa = furniture           hva = heavy equipment  mca = motorcycle parts
-SEARCH_PATHS = ["/search/sss"]
+# WHY A LIST OF CATEGORIES (not just "/search/sss"):
+# The no-JS results page we parse (to stay block-resistant) only serves the
+# newest ~400 listings PER search path, total — and the "?s=<offset>" param
+# re-serves that same newest set rather than paging deeper. So "/search/sss"
+# alone (= ALL for-sale categories) tops out around ~400 of the newest items
+# across everything combined, no matter how many pages you ask for.
+#
+# The fix for both VOLUME and a PROFIT focus is breadth: each category has its
+# OWN newest ~few-hundred, so crawling the profitable categories multiplies the
+# distinct listings AND concentrates the (limited) Gemini quota on the stuff
+# worth flipping. Listings cross-posted to two feeds are de-duped automatically.
+#
+# The codes below are the REAL Kansas City section codes (pulled from live
+# listing URLs), ordered roughly by flip value. "/search/sss" is kept as a
+# catch-all backstop so coverage never drops to zero even if a code is off.
+#
+# TO ADD/REMOVE A CATEGORY: on the site, click a category and copy the code that
+# appears after "/search/" in the address bar. After a run, check the log: any
+# path that prints "parsed 0 rows" isn't valid for your city — comment it out.
+# To go leaner (less quota), trim this to just the few categories you flip most.
+SEARCH_PATHS = [
+    "/search/sss",   # all for sale — broad backstop (newest ~400 overall)
+    "/search/tls",   # tools
+    "/search/ele",   # electronics
+    "/search/fuo",   # furniture (by owner — where the deals are)
+    "/search/app",   # appliances
+    "/search/spo",   # sporting goods
+    "/search/pho",   # photo + video
+    "/search/jwl",   # jewelry
+    "/search/atq",   # antiques
+    "/search/bik",   # bikes
+    "/search/sys",   # computers
+    "/search/vgm",   # video gaming
+    "/search/msg",   # musical instruments
+    "/search/hvo",   # heavy equipment
+    "/search/pts",   # auto parts
+    "/search/mpo",   # motorcycle parts
+    "/search/mcy",   # motorcycles
+    "/search/wto",   # wheels + tires
+    "/search/tro",   # trailers
+    "/search/grd",   # farm + garden
+    "/search/mat",   # materials
+]
 
-# How many result pages to fetch PER search path. One page of /search/sss
-# returns roughly 340-360 of the newest listings, so ~9 pages ≈ the newest
-# ~3,000 items across all for-sale categories. The source also caps a single
-# search at about 3,000 results, so going much past this returns nothing and
-# the crawler stops on its own. Pagination uses the "?s=<offset>" query param.
+# How many result pages to fetch PER search path. Set to 1 on purpose: as noted
+# above, the no-JS feed re-serves the same newest set on "?s=" pages instead of
+# paging deeper, so page 2+ is almost entirely duplicates (wasted requests and
+# block risk for ~nothing). Volume comes from the category breadth above, not
+# from depth on any one feed. Each NEW listing still triggers one detail-page
+# fetch; coverage of each category fills in over subsequent runs.
 #
-# HEADS-UP: more pages = more requests AND a detail-page fetch per NEW listing.
-# The FIRST run on a fresh repo has ~3,000 new listings to detail-fetch, which
-# is long (see SCRAPE_DETAIL_PAGE_TIME_BUDGET_SECONDS) and raises the chance the
-# source temporarily blocks the runner. Coverage fills in over subsequent runs;
-# steady-state runs only detail-fetch the handful of genuinely-new listings.
-# Lower this (e.g. 3-4) if you get blocked a lot or want shorter runs.
-MAX_PAGES_PER_SEARCH = 9
+# If you ever do want to try deeper paging, raise this AND know that offsets now
+# step by PAGE_OFFSET_STEP (the site's true 120-per-page unit), so a higher value
+# at least lands on real page boundaries. The crawler still stops a feed early
+# the moment a page yields no new listings.
+MAX_PAGES_PER_SEARCH = 1
+
+# Pagination offset unit. The site paginates in fixed 120-item steps, so page N
+# is "?s=<120*N>". (Earlier this stepped by the parsed row count, which landed
+# between real pages and forced duplicate results.) Only matters if you raise
+# MAX_PAGES_PER_SEARCH above 1.
+PAGE_OFFSET_STEP = 120
 
 
 # ─── BEHAVIOR ────────────────────────────────────────────────────────────────
@@ -211,6 +247,18 @@ SALES_VELOCITY_SCORES = {
 # history. Setting this very high grows the repo over time (GitHub's hard limit
 # is 100 MB per file).
 RETENTION_DAYS = 30
+
+# Skip listings POSTED more than this many days ago: don't enrich them and don't
+# score them, so the (limited) Gemini quota and the dashboard both stay on fresh
+# deals. This is distinct from RETENTION_DAYS above — that counts from when WE
+# first saw a listing; this counts from the listing's own POST date, so a months-
+# old post we only just discovered gets skipped too. Set to 0 to disable.
+#
+# Caveat: this keys off the original post date. A stale listing the seller keeps
+# "renewing" shows a fresh position in the feed but an old post date, so it gets
+# filtered here — usually the right call (long-unsold = picked over). Listings
+# whose date can't be parsed are kept (we don't filter on missing data).
+MAX_LISTING_AGE_DAYS = 60
 
 # Pretty-print docs/data/items.json? False = single-line JSON (~30% smaller).
 # Set True for human-readable file in git diffs at the cost of size.
