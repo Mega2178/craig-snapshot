@@ -91,9 +91,9 @@ class ItemValuation(BaseModel):
     """
     item_id: str = Field(description="The item_id we sent in the request, echo it back exactly")
     product_identified: str = Field(description="Brief identification of the specific item you are valuing, e.g. 'Sony WH-CH520 wireless headphones'. For a multi-item listing, this is the ONE item you chose to value.")
-    listing_kind: str = Field(description="One of: single_item, multi_item, not_for_sale. single_item = one item for sale. multi_item = one ad covering several different items / a lot / a bundle. not_for_sale = a wanted/ISO ad, a garage-sale or estate-sale announcement, found/lost property, a service, housing, or anything that is not one specific physical item being sold. See system instructions.")
-    price_is_placeholder: bool = Field(description="True if the listing's asking price is a teaser/placeholder/aggregate rather than the real cash price of the item you valued — e.g. a nominal $1 or $5 with 'make offer', sequential or repeated digits like 1234 or 11111, or a single price covering many different items. False for a normal, real asking price. See system instructions.")
-    effective_price_usd: float = Field(description="Your best estimate of the realistic cash price to BUY the one item you valued, in USD. If the listing states a per-item price (e.g. '$45 each', '1955 Chevy $45'), use that. If it is a bundle / 'make offer' / placeholder and you cannot determine the price of the specific item, set 0. Do NOT echo a placeholder price. Set 0 when genuinely unknown.")
+    listing_kind: str = Field(description="One of: single_item, multi_item, not_for_sale. single_item = one item for sale. multi_item = one ad covering several different items / a lot / a bundle / a liquidation or 'everything must go' sale (value only the SINGLE most valuable item). not_for_sale = a wanted/ISO ad, a GARAGE/ESTATE/MOVING-SALE announcement, found/lost property, a service, a labor/haul-away request, housing, or anything that is not one specific item being sold. See system instructions.")
+    price_status: str = Field(description="One of: priced, free, unknown. 'priced' = you found a real cash price (in the price field OR anywhere in the description) for the item you valued. 'free' = the listing EXPLICITLY gives it away (says 'free', 'curb alert', 'free to good home'). 'unknown' = no determinable price (pure 'make offer' with no number, or a placeholder with nothing in the text). A $0 or missing price field does NOT mean free — read the description. See system instructions.")
+    effective_price_usd: float = Field(description="The real cash price to BUY the one item you valued, in USD, when price_status is 'priced'. READ THE DESCRIPTION: sellers often leave the price field at $0 or a placeholder ($1, $5, 1234) and put the real price in the text ('I'm wanting 250 for it', '$150 obo', '$500 cash', 'Queen $90 and up'). Extract that number. For a per-item or 'and up' price, use the single item's price. Set 0 when price_status is 'free' or 'unknown'. Never echo a placeholder as if it were the real price.")
     current_retail_usd: float = Field(description="Realistic CURRENT retail price NEW in USD (Amazon/Walmart 2026) of the item you valued. 0 if unknown.")
     resale_pct: float = Field(description="Estimated resale value of the item you valued as a fraction of its retail in the local secondhand market (Facebook Marketplace / OfferUp). E.g. 0.55 means it typically sells used for 55% of retail. Use 0 if unknown.")
     sales_velocity: str = Field(description="Estimated speed of selling the item you valued on Facebook Marketplace in the local metro. One of: hot, normal, slow, very_slow, unknown. See system instructions for criteria.")
@@ -112,50 +112,61 @@ SYSTEM_PROMPT = """You are an expert resale-value estimator for a person who
 buys items from a local classifieds marketplace (private-party listings) and
 re-sells them on Facebook Marketplace in the same metro.
 
-FIRST, before valuing anything, classify the listing and ground the price.
-Classifieds listings are messy: many are bundles, "make offer" ads with a fake
-placeholder price, or not items for sale at all. Getting this right matters
-more than the valuation, because a wrong price produces a garbage deal score.
+FIRST, before valuing anything, classify the listing and find the REAL price.
+Classifieds listings are messy: the structured asking price is frequently
+missing, $0, or a placeholder, with the true price written in the description.
+Bundles, liquidations, "make offer" ads, and ads that aren't selling one item
+are all common. Getting this right matters MORE than the valuation, because a
+wrong price produces a garbage deal score.
 
 A. LISTING_KIND — pick exactly one:
    • "single_item"  = one specific item (or a matched set sold as one unit, like
-                      a set of 4 hubcaps) for sale at a stated price.
-   • "multi_item"   = ONE ad covering several DIFFERENT items, a lot, or a
-                      bundle — e.g. "Dressers, tables, couches, chairs all for
-                      sale", or a list of separately-priced tools. For these,
+                      a set of 4 hubcaps) for sale.
+   • "multi_item"   = ONE ad covering several DIFFERENT items, a lot, a bundle,
+                      OR a liquidation / "everything must go" / "$X and up"
+                      sale — e.g. "Dressers, tables, couches, chairs all for
+                      sale", a list of separately-priced tools, or "Queen
+                      mattresses $90 and up, King $125 and up". For these,
                       choose the SINGLE most valuable item you can clearly
-                      identify (from the photo and text) and value ONLY that one
-                      item. Every field below (product_identified, retail,
-                      resale, velocity, condition) must describe that one item.
+                      identify and value ONLY that one item. Every field below
+                      (product_identified, retail, resale, velocity, condition)
+                      must describe that one item — NOT the whole pile.
    • "not_for_sale" = NOT one item being sold. Includes: wanted/ISO ("looking
-                      for", "need", "ISO"), garage-/estate-/moving-sale
-                      announcements, found/lost property, services, jobs,
-                      housing/rooms, personal ads. For these, set
-                      effective_price_usd = 0 and current_retail_usd = 0,
+                      for", "need", "ISO"), GARAGE / ESTATE / MOVING / YARD SALE
+                      announcements (a title like "Garage sale" is ALWAYS
+                      not_for_sale), found/lost property, labor or haul-away
+                      requests, services, jobs, housing/rooms, personal ads.
+                      Set price_status = "unknown", current_retail_usd = 0,
                       confidence = "unknown", and say so in notes.
 
-B. PRICE_IS_PLACEHOLDER (true/false) — is the headline asking price fake?
-   Mark TRUE when the price is not the real cash price of the item you valued:
-     • a nominal $1 or $5 (or similar) paired with "make offer", "OBO on
-       everything", "best offer", "make offer on anything";
-     • sequential or repeated digits used as filler — 123, 1234, 12345, 11111,
-       99999, and the like;
-     • a single price stamped on an ad that actually contains many different
-       items at different (or unstated) prices.
-   Mark FALSE for an ordinary, real asking price (including normal round
-   numbers like $40, $250, $1,600).
+B. PRICE_STATUS — pick exactly one, AFTER reading the whole description:
+   • "priced"  = you found a real cash price for the item you valued, EITHER in
+                 the price field OR anywhere in the description. Put it in
+                 effective_price_usd.
+   • "free"    = the listing EXPLICITLY gives the item away — it says "free",
+                 "curb alert", "free to good home", "$0 just come get it", etc.
+                 Set effective_price_usd = 0. (A genuinely free item is a great
+                 flip, so this is allowed to score.)
+   • "unknown" = there is genuinely no determinable price anywhere: a pure "make
+                 offer" with no number, or a placeholder ($1/$5/1234) with no
+                 real price in the text. Set effective_price_usd = 0. Do NOT
+                 guess a number.
 
-C. EFFECTIVE_PRICE_USD — the realistic cash price to BUY the one item you
-   valued:
-     • If the listing states that item's price (e.g. "$45 each", "1955 Chevy
-       $45", "doors $50 each"), use that number.
-     • If it's a normal single_item with a real asking price, use the asking
-       price.
-     • If it's a bundle / "make offer" / placeholder and you CANNOT determine
-       the specific item's price, set 0. Never echo a placeholder as if it were
-       real, and never guess a number out of thin air. 0 means "unknown", and
-       the downstream system will correctly skip scoring it rather than invent
-       a deal.
+   CRITICAL: A $0 or missing PRICE FIELD does NOT mean the item is free. It
+   almost always means the seller put the price in the description, or wants an
+   offer. Read the description and HUNT for the price. Only choose "free" when
+   the listing actually says it's being given away.
+
+C. EFFECTIVE_PRICE_USD — when price_status is "priced", the real cash price to
+   BUY the one item you valued. Extract it from wherever it appears:
+     - price written in prose: "I'm wanting 250 for it" → 250
+     - "$150 or best offer" → 150
+     - "SELLING ALL COMPLETE $500.00 CASH OBO" → 500
+     - a per-item / "and up" price for the item you chose: "Queen $90 and up" →
+       90 (for a queen);  "doors $50 each" → 50
+     - a normal price field with no contradiction in the text → use it
+   Set 0 when price_status is "free" or "unknown". NEVER echo a $1 / $5 / 1234
+   placeholder as the price, and never invent a number.
 
 THEN value the item. Fill in ALL of these fields for the ONE item you valued:
 

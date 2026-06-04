@@ -74,7 +74,7 @@ CSV_FIELDS = [
     "ai_sales_velocity",     # hot / normal / slow / very_slow / unknown
     "ai_condition",          # new / open_box / damaged_easy_fix / damaged_hard_fix
     "ai_listing_kind",       # single_item / multi_item / not_for_sale
-    "ai_price_is_placeholder",  # "yes" if headline price is a teaser/aggregate
+    "ai_price_status",       # priced / free / unknown
     "value_overridden",      # "yes" if we forced resale to $0 (damaged_hard_fix / not_for_sale)
     "ai_product",            # the one item the model actually valued
     "title",
@@ -337,14 +337,30 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
     from enricher import Enricher, chunked, QuotaExhausted  # lazy import
     import threading as _threading
 
-    pending: list[Item] = [
-        it for it in items.values() if not it.ai_confidence
-    ]
+    # Only enrich items that already have their detail page (description +
+    # photo). When detail-fetching is on, an item with description_enriched
+    # False hasn't had its photo pulled yet, and we'd rather wait and enrich it
+    # WITH the photo on a later run than spend a call on a title-only guess
+    # (which would also never be re-enriched, since it'd then have a confidence).
+    # When detail-fetching is off, enrich everything pending.
+    def _ready(it: Item) -> bool:
+        if it.ai_confidence:
+            return False
+        if config.SCRAPE_ITEM_DETAIL_PAGES and not it.description_enriched:
+            return False
+        return True
+
+    pending: list[Item] = [it for it in items.values() if _ready(it)]
     print(f"\n=== ENRICH ===")
     if limit is not None and len(pending) > limit:
         print(f"  (test mode: capping enrichment at {limit} of {len(pending)} pending)")
         pending = pending[:limit]
-    print(f"{len(pending)} items need AI enrichment")
+    waiting = sum(1 for it in items.values()
+                  if (not it.ai_confidence)
+                  and config.SCRAPE_ITEM_DETAIL_PAGES
+                  and not it.description_enriched)
+    print(f"{len(pending)} items need AI enrichment"
+          + (f" ({waiting} more await a detail page on a later run)" if waiting else ""))
     if not pending:
         return items
 
@@ -400,7 +416,7 @@ def do_enrich(items: dict[str, Item], limit: int | None = None) -> dict[str, Ite
             it.ai_sales_velocity = v.sales_velocity
             it.ai_product = (v.product_identified or "").strip()
             it.ai_listing_kind = (v.listing_kind or "").strip().lower()
-            it.ai_price_is_placeholder = "yes" if v.price_is_placeholder else ""
+            it.ai_price_status = (v.price_status or "").strip().lower()
             it.ai_effective_price = (
                 f"{v.effective_price_usd:.2f}" if v.effective_price_usd > 0 else ""
             )
@@ -485,53 +501,78 @@ def _cost_basis(it: Item) -> tuple[float | None, str]:
 
     Returns (cost_usd, basis_label). cost is None when the price can't be
     trusted, which makes the item unscoreable (no flip score → it sinks instead
-    of producing a fake deal). Priority:
+    of producing a fake deal).
 
-      1. not_for_sale listing                 → (None, "not_for_sale")
-      2. model gave an effective price > 0    → use it           ("ai_effective")
-      3. single_item, NOT placeholder,
-         real headline price (not a teaser)   → use the headline ("listed")
-      4. genuine free single item ("$0")      → (0.0, "free")
-      5. anything else (bundle w/o per-item
-         price, "make offer", placeholder)    → (None, "unknown")
+    Driven by the model's price_status (priced / free / unknown):
+      • not_for_sale listing                        → (None, "not_for_sale")
+      • price_status "free"                          → (0.0,  "free")
+      • price_status "priced" + effective price >0   → (eff,  "ai_effective")
+      • price_status "priced" but no effective price,
+        and the scraped headline looks clearly real
+        (>= $20, not a placeholder number)           → (headline, "listed")
+      • everything else ("unknown", make-offer,
+        placeholder with no real price)              → (None, "unknown")
 
-    Note: the scraped headline can only ever be used for a single_item — a
-    bundle's one price is never trusted to represent the item we valued.
+    The scraped headline is used only as a narrow safety net for a model
+    omission on an obviously-real price; the ambiguous $0/$1/$5 range is never
+    trusted from the field alone — the model must have extracted it.
     """
     kind = (it.ai_listing_kind or "single_item").strip().lower()
     if kind == "not_for_sale":
         return None, "not_for_sale"
 
+    status = (it.ai_price_status or "").strip().lower()
     eff = _to_float(it.ai_effective_price)
-    if eff is not None and eff > 0:
-        return eff, "ai_effective"
 
-    placeholder = _is_yes(it.ai_price_is_placeholder)
-    if kind == "single_item" and not placeholder:
+    # ---- legacy items enriched before price_status existed -----------------
+    # (no ai_price_status set). Fall back to the old effective/headline/$0
+    # heuristics so they still score until they're re-enriched.
+    if not status:
+        return _cost_basis_legacy(it, eff)
+
+    if status == "free":
+        return 0.0, "free"
+
+    if status == "priced":
+        if eff is not None and eff > 0:
+            return eff, "ai_effective"
+        # model said priced but gave no number — trust the field only if it's
+        # an unambiguously-real price.
         listed = it.price_value if it.price_value else _to_float(it.price)
-        if listed is not None and listed > 0 and int(listed) not in _PLACEHOLDER_PRICES:
+        if (listed is not None and listed >= 20.0
+                and int(listed) not in _PLACEHOLDER_PRICES):
             return listed, "listed"
-        # Genuine free item: an explicit $0 (the detail page / JSON-LD fills
-        # "$0" for free listings). A free valuable item is a great flip.
-        if (it.price or "").strip() in ("$0", "$0.00", "0"):
-            return 0.0, "free"
 
     return None, "unknown"
 
 
+def _cost_basis_legacy(it: Item, eff: float | None) -> tuple[float | None, str]:
+    """Cost basis for items enriched before price_status existed."""
+    kind = (it.ai_listing_kind or "single_item").strip().lower()
+    if eff is not None and eff > 0:
+        return eff, "ai_effective"
+    # ai_price_is_placeholder is a removed field; legacy JSON may not carry it.
+    placeholder = _is_yes(getattr(it, "ai_price_is_placeholder", ""))
+    if kind == "single_item" and not placeholder:
+        listed = it.price_value if it.price_value else _to_float(it.price)
+        if listed is not None and listed > 0 and int(listed) not in _PLACEHOLDER_PRICES:
+            return listed, "listed"
+        if (it.price or "").strip() in ("$0", "$0.00", "0"):
+            return 0.0, "free"
+    return None, "unknown"
+
+
 def _purchase_price(it: Item) -> float | None:
-    """Realistic out-of-pocket cost: cost basis * NEGOTIATION_FACTOR.
+    """Cost to acquire the valued item: the cost basis as-is, no discount.
 
     The cost basis (see _cost_basis) is the model's per-item effective price
     when available, else the scraped headline price only for a trustworthy
     single-item listing, else None. Returns None when unscoreable.
     """
     cost, _basis = _cost_basis(it)
-    if cost is None:
+    if cost is None or cost < 0:
         return None
-    if cost < 0:
-        return None
-    return cost * config.NEGOTIATION_FACTOR
+    return cost
 
 
 def _condition_resale_factor(it: Item) -> float:
@@ -552,9 +593,9 @@ def _condition_resale_factor(it: Item) -> float:
 
 def compute_flip_score(it: Item) -> str:
     """flip_score (ROI) =
-        (effective_resale - purchase_price - hassle) / purchase_price
+        (effective_resale - cost - hassle) / cost
 
-    purchase_price = asking_price * NEGOTIATION_FACTOR.
+    cost = the item's effective price (no negotiation discount).
     effective_resale = estimated_resale * condition_resale_factor.
 
     Returns a string. Empty if unknown / can't compute.
@@ -614,6 +655,29 @@ def recompute_all_flip_scores(items: dict[str, Item]) -> None:
 
 # ────────────────────────────── main ────────────────────────────────────────
 
+def migrate_legacy_for_reenrich(items: dict[str, Item]) -> int:
+    """Re-enrich, once, items saved before the price_status field existed.
+
+    Those rows were valued by an older prompt that didn't extract prices from
+    the description, so their cost can be wrong. We clear their AI confidence
+    and scores (only when their detail page/photo is already cached, so they
+    re-enrich this same run) and let do_enrich redo them under the new logic.
+    Detected purely by the absence of ai_price_status, so it self-clears after
+    one pass and is a no-op on a fresh repo. Returns the number flagged.
+    """
+    n = 0
+    for it in items.values():
+        if (it.ai_confidence
+                and not (it.ai_price_status or "").strip()
+                and it.description_enriched):
+            it.ai_confidence = ""
+            it.enriched_at = ""
+            it.flip_score = ""
+            it.gross_profit = ""
+            n += 1
+    return n
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--scrape", action="store_true",
@@ -651,6 +715,15 @@ def main():
             print(f"purged {removed} stale items "
                   f"(>{config.RETENTION_DAYS}d since first seen); "
                   f"{len(items)} remain")
+
+    # One-time migration: items enriched before price_status existed get
+    # re-enriched once under the improved price extraction. Only those whose
+    # detail page (photo) is already cached are cleared, so they re-enrich this
+    # run rather than getting stuck. Cheap (a few extra batches) and self-clears.
+    migrated = migrate_legacy_for_reenrich(items)
+    if migrated:
+        print(f"flagged {migrated} legacy items (no price_status) for one-time "
+              f"re-enrichment under the new price logic")
 
     scrape_secs = None
     enrich_secs = None

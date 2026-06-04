@@ -32,29 +32,31 @@ consumed by a static frontend in `docs/`, served via GitHub Pages.
 ## How scoring works
 
 For each listing the model first classifies it (`single_item`, `multi_item`,
-or `not_for_sale`) and grounds the price — because a classifieds "price" is
-often a placeholder ("$5, make offer on anything"), an aggregate over a bundle,
-or attached to an ad that isn't selling one item. For a bundle it values the
-single most valuable item shown. It returns an `effective_price_usd` (the real
-cash cost of the item it valued, or 0 if it genuinely can't tell) and a
-`price_is_placeholder` flag. Then it estimates the item's real retail value
-(independent of the asking price), a resale percentage, a sales-velocity tier,
-a condition tier, and a confidence level. From those:
+or `not_for_sale`) and finds the real price. A classifieds price field is
+frequently missing, `$0`, or a placeholder (`$1`, `$5`, `1234`) with the true
+price written in the description ("I'm wanting 250 for it", "$150 obo", "Queen
+$90 and up"), so the model **reads the description to extract the price**. It
+returns a `price_status` — `priced` (real price found, in `effective_price_usd`),
+`free` (explicitly given away), or `unknown` (genuinely no determinable price) —
+and for a bundle it values only the single most valuable item. Then it estimates
+the item's real retail value (independent of the asking price), a resale
+percentage, a sales-velocity tier, a condition tier, and a confidence level.
+From those:
 
-- **cost basis** = the model's `effective_price_usd` when available; otherwise
-  the scraped headline price, but only for a trustworthy `single_item` (never
-  for a bundle, a placeholder, or a not-for-sale ad). When no price can be
-  trusted, the listing is left **unscored** so it can't produce a fake deal —
-  it still shows under "Newest" with a *bundle* / *price?* badge. The
-  `cost_basis` column in the CSV records which path was used.
-- **purchase price** = cost basis × `NEGOTIATION_FACTOR` (light haggling; no
-  buyer's premium or tax on a private sale).
+- **cost** = the model's `effective_price_usd` when `price_status` is `priced`;
+  `$0` when `free`; and the listing is left **unscored** when `unknown` (or
+  `not_for_sale`) so a missing/placeholder price can't fabricate a deal. A `$0`
+  price field is *not* assumed to be free — only an explicit give-away is. Cost
+  is used as-is (no negotiation discount), so only listings priced below their
+  resale value surface as deals. Unscored listings still appear under "Newest"
+  with a *bundle* / *price?* badge. The `cost_basis` column in the CSV records
+  which path was used (`ai_effective` / `free` / `listed` / `unknown` /
+  `not_for_sale`).
 - **effective resale** = estimated resale × a condition factor (full for
   new/open-box, a small haircut for an easy fix, zero for broken/unsellable or
   not-for-sale).
-- **ROI (flip score)** = (effective resale − purchase price − pickup hassle) ÷
-  purchase price.
-- **gross profit** = effective resale − purchase price − pickup hassle.
+- **ROI (flip score)** = (effective resale − cost − pickup hassle) ÷ cost.
+- **gross profit** = effective resale − cost − pickup hassle.
 
 The dashboard's default "smart score" blends ROI, gross profit, and velocity.
 
@@ -142,16 +144,33 @@ If a daily quota wall is hit mid-run, already-enriched records are saved and
 the run exits cleanly. Re-running with `--enrich` after the quota resets picks
 up the rest.
 
-## A note on reliability
+## A note on reliability and volume
 
 The source actively rate-limits and blocks automated traffic from datacenter IP
 ranges, which is what GitHub's hosted runners use. The scraper is deliberately
-polite (slow request pacing, a realistic browser User-Agent, one results page
-per category by default), but some scheduled runs may still come back short or
-empty if the source serves a challenge page. That's expected; the next run
-generally recovers, and cached data keeps the dashboard populated in between.
-Lowering `MAX_PAGES_PER_SEARCH` and raising `SCRAPE_DELAY_SECONDS` reduce the
-chance of being blocked.
+polite (slow request pacing, a realistic browser User-Agent), but some runs may
+still come back short or empty if the source serves a challenge page. That's
+expected; the next run generally recovers, and cached data keeps the dashboard
+populated in between.
+
+By default it pulls the newest ~3,000 listings across all for-sale categories
+(`MAX_PAGES_PER_SEARCH = 9`). Two consequences worth knowing:
+
+- The **first run on a fresh repo is long** — it has ~3,000 brand-new listings
+  to fetch detail pages for (one request each, ~2s apart), so it can run well
+  over an hour, and it's the run most likely to hit a temporary block. If the
+  detail-fetch time budget is reached, the rest are fetched and enriched on the
+  next scheduled run. Coverage fills in within a day; steady-state runs only
+  detail-fetch the handful of genuinely-new listings, so they're quick.
+- Only listings whose detail page (and photo) has been fetched are sent for
+  enrichment, so every scored item is photo-backed rather than a title-only
+  guess. Items still awaiting a detail page show up once a later run fetches them.
+
+To dial it back: lower `MAX_PAGES_PER_SEARCH` (e.g. 3-4) and/or raise
+`SCRAPE_DELAY_SECONDS`. Both reduce request volume and the chance of a block.
+Note the cumulative dataset grows with volume × `RETENTION_DAYS`; lower
+`RETENTION_DAYS` if you want the dashboard to stay tightly focused on the newest
+listings rather than a month of history.
 
 ## Troubleshooting
 

@@ -12,7 +12,7 @@
 // Bump CACHE_VERSION whenever you change app.js, index.html, or style.css so
 // old clients pick up the new code on next reload.
 
-const CACHE_VERSION = "v1";
+const CACHE_VERSION = "v2";
 const STATIC_CACHE  = `static-${CACHE_VERSION}`;
 const DATA_CACHE    = `data-${CACHE_VERSION}`;
 

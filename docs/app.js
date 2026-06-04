@@ -53,10 +53,9 @@
     "": 0.0,
   };
 
-  // Purchase-price model mirrors config.py: cost to acquire ≈ asking price ×
-  // NEGOTIATION_FACTOR (you talk them down ~10%). HASSLE mirrors
-  // config.PICKUP_HASSLE_DOLLARS. KEEP THESE IN SYNC WITH config.py.
-  const NEGOTIATION_FACTOR = 0.9;
+  // Cost model mirrors config.py: the cost to acquire an item is its effective
+  // price as-is (no negotiation discount). HASSLE mirrors
+  // config.PICKUP_HASSLE_DOLLARS. KEEP THIS IN SYNC WITH config.py.
   const HASSLE = 10.0;
 
   // ─── Condition tiers ────────────────────────────────────────────
@@ -331,30 +330,30 @@
 
   // Cost BASIS — mirrors _cost_basis() in scrape.py. Returns the realistic cash
   // cost to buy the one item that was valued, or NaN when the price can't be
-  // trusted (bundle without a per-item price, "make offer", placeholder, or a
-  // not-for-sale listing) — those become unscoreable and sink, exactly as on
-  // the backend. KEEP THIS IN LOCKSTEP WITH scrape.py.
+  // trusted (bundle/make-offer/placeholder with no real price, or not_for_sale)
+  // — those become unscoreable and sink, exactly as on the backend.
+  // KEEP THIS IN LOCKSTEP WITH scrape.py.
   function costBasisNum(item) {
     if (item._costBasis !== undefined) return item._costBasis;
     let cost = NaN;
     const kind = (item.ai_listing_kind || "single_item").trim().toLowerCase();
-    if (kind === "not_for_sale") {
-      item._costBasis = NaN;
-      return NaN;
-    }
+    if (kind === "not_for_sale") { item._costBasis = NaN; return NaN; }
+
+    const status = String(item.ai_price_status || "").trim().toLowerCase();
     const eff = num(item.ai_effective_price);
-    if (!isNaN(eff) && eff > 0) {
-      cost = eff;
-    } else {
-      const placeholder =
-        String(item.ai_price_is_placeholder || "").trim().toLowerCase() === "yes";
-      if (kind === "single_item" && !placeholder) {
+
+    if (!status) {
+      // Legacy item enriched before price_status existed.
+      cost = costBasisLegacy(item, eff, kind);
+    } else if (status === "free") {
+      cost = 0;
+    } else if (status === "priced") {
+      if (!isNaN(eff) && eff > 0) {
+        cost = eff;
+      } else {
         const listed = priceNum(item);
-        if (!isNaN(listed) && listed > 0 && !PLACEHOLDER_PRICES.has(Math.trunc(listed))) {
+        if (!isNaN(listed) && listed >= 20 && !PLACEHOLDER_PRICES.has(Math.trunc(listed))) {
           cost = listed;
-        } else {
-          const raw = String(item.price || "").trim();
-          if (raw === "$0" || raw === "$0.00" || raw === "0") cost = 0;
         }
       }
     }
@@ -362,10 +361,25 @@
     return cost;
   }
 
-  // Realistic out-of-pocket cost: cost basis × NEGOTIATION_FACTOR.
+  // Legacy fallback (items without price_status) — mirrors _cost_basis_legacy.
+  function costBasisLegacy(item, eff, kind) {
+    if (!isNaN(eff) && eff > 0) return eff;
+    const placeholder =
+      String(item.ai_price_is_placeholder || "").trim().toLowerCase() === "yes";
+    if (kind === "single_item" && !placeholder) {
+      const listed = priceNum(item);
+      if (!isNaN(listed) && listed > 0 && !PLACEHOLDER_PRICES.has(Math.trunc(listed))) {
+        return listed;
+      }
+      const raw = String(item.price || "").trim();
+      if (raw === "$0" || raw === "$0.00" || raw === "0") return 0;
+    }
+    return NaN;
+  }
+
+  // Cost to acquire the valued item: the cost basis as-is (no discount).
   function purchasePriceNum(item) {
-    const c = costBasisNum(item);
-    return isNaN(c) ? NaN : c * NEGOTIATION_FACTOR;
+    return costBasisNum(item);
   }
 
   // ─── Posted-time helpers ────────────────────────────────────────
@@ -685,7 +699,7 @@
       scoreEl.title =
         `ROI: ${f.toFixed(2)}× — ` +
         `(effective resale − cost − $${HASSLE.toFixed(0)} hassle) ÷ cost. ` +
-        `Cost = effective item price × ${NEGOTIATION_FACTOR.toFixed(2)}. ` +
+        `Cost = the item's effective price. ` +
         `Effective resale = est. resale × condition factor.`;
     }
 
@@ -770,7 +784,7 @@
       }
     }
 
-    // Stats: asking price, purchase cost (×0.9), resale, retail
+    // Stats: asking price, cost (effective price), resale, retail
     node.querySelector('[data-role="price"]').textContent = item.price || "—";
     const costEl = node.querySelector('[data-role="purchase-price"]');
     if (costEl) {
@@ -781,7 +795,7 @@
         costEl.title = "No reliable acquisition price — check the listing";
       } else {
         costEl.textContent = "$" + cost.toFixed(2);
-        costEl.title = "Realistic out-of-pocket: effective item price × 0.9 (light haggling)";
+        costEl.title = "What you'd pay for this item (its effective per-item price)";
       }
     }
     const resale = num(item.ai_estimated_resale);

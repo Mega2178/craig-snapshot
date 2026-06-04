@@ -80,7 +80,7 @@ class Item:
     ai_sales_velocity: str = ""    # hot/normal/slow/very_slow/unknown
     ai_product: str = ""           # what the model decided this (one) item is
     ai_listing_kind: str = ""      # single_item/multi_item/not_for_sale
-    ai_price_is_placeholder: str = ""  # "yes" if headline price is a teaser/aggregate
+    ai_price_status: str = ""      # priced / free / unknown (how to read the price)
     ai_effective_price: str = ""   # model's realistic cash price for the valued item ("" = unknown)
     value_overridden: str = ""     # "yes" if we forced resale to $0
     ai_notes: str = ""

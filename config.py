@@ -58,12 +58,19 @@ SITE_SUBDOMAIN = "kansascity"
 #     foa = furniture           hva = heavy equipment  mca = motorcycle parts
 SEARCH_PATHS = ["/search/sss"]
 
-# How many result pages to fetch PER search path. One page already returns the
-# newest few hundred listings, which is plenty for a flip hunt and keeps the
-# request count (and the chance of getting blocked) low. Bump to 2-3 only if
-# you want deeper coverage and accept more requests. Pagination uses the site's
-# "?s=<offset>" query param under the hood.
-MAX_PAGES_PER_SEARCH = 1
+# How many result pages to fetch PER search path. One page of /search/sss
+# returns roughly 340-360 of the newest listings, so ~9 pages ≈ the newest
+# ~3,000 items across all for-sale categories. The source also caps a single
+# search at about 3,000 results, so going much past this returns nothing and
+# the crawler stops on its own. Pagination uses the "?s=<offset>" query param.
+#
+# HEADS-UP: more pages = more requests AND a detail-page fetch per NEW listing.
+# The FIRST run on a fresh repo has ~3,000 new listings to detail-fetch, which
+# is long (see SCRAPE_DETAIL_PAGE_TIME_BUDGET_SECONDS) and raises the chance the
+# source temporarily blocks the runner. Coverage fills in over subsequent runs;
+# steady-state runs only detail-fetch the handful of genuinely-new listings.
+# Lower this (e.g. 3-4) if you get blocked a lot or want shorter runs.
+MAX_PAGES_PER_SEARCH = 9
 
 
 # ─── BEHAVIOR ────────────────────────────────────────────────────────────────
@@ -87,11 +94,13 @@ SCRAPE_ITEM_DETAIL_PAGES = True
 RECHECK_EXISTING_DETAILS = False
 
 # Max seconds to spend fetching detail pages in one run. Once exceeded, the
-# scraper stops detail-page fetches and lets the rest enrich on title-only
-# data. Prevents a huge day from blowing past the GitHub Actions timeout. The
-# leftover listings get detail-fetched on a subsequent run (they're cached
-# without the detail flag).
-SCRAPE_DETAIL_PAGE_TIME_BUDGET_SECONDS = 3000  # 50 min
+# scraper stops detail-page fetches; the leftover listings get fetched on a
+# subsequent run (they're cached without the detail flag) and enriched then.
+# At ~2s/page this allows roughly 3,000 detail fetches, enough to cover a full
+# ~3,000-item first run when the source isn't throttling. It's a hard ceiling
+# so a blocked/slow run can't blow past the workflow's 240-minute timeout —
+# detail fetching just stops and enrichment proceeds on whatever was fetched.
+SCRAPE_DETAIL_PAGE_TIME_BUDGET_SECONDS = 6500  # ~108 min
 
 
 # ─── GEMINI ENRICHMENT ───────────────────────────────────────────────────────
@@ -164,13 +173,11 @@ IMAGE_MEDIA_RESOLUTION = "low"
 
 
 # ─── PURCHASE PRICE MODEL ────────────────────────────────────────────────────
-# Unlike an auction (where the listed number is a starting bid), a classifieds
-# asking price IS roughly the cost — but sellers expect a little haggling. We
-# model the realistic out-of-pocket cost as asking_price * NEGOTIATION_FACTOR.
-# 0.9 assumes you talk them down ~10% on average. There is no buyer's premium
-# or sales tax on a private-party sale, so there's no markup multiplier here.
-# Set to 1.0 to score against full asking price.
-NEGOTIATION_FACTOR = 1.0
+# The cost to acquire an item is its effective price as-is — the model's
+# per-item effective price (or the headline price for a trustworthy single
+# item). No negotiation discount is applied: scoring is against the price you
+# actually see, so only listings priced BELOW their resale value float up as
+# real deals. (There's also no buyer's premium or sales tax on a private sale.)
 
 # Pickup hassle fudge factor (dollars subtracted when computing flip score).
 # Set a little higher than an auction tool would: classifieds pickups mean
