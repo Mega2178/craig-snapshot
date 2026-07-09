@@ -21,12 +21,54 @@ import json
 import os
 import sys
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import config
 from scraper import Item, Session, crawl_all
+
+
+class DataLoadError(Exception):
+    """Raised when the saved dataset exists but can't be read/parsed. We abort
+    rather than silently continue with an empty set (which the next write would
+    commit over the good data)."""
+
+
+@dataclass
+class ScrapeOutcome:
+    """What a scrape pass discovered, used by the run guards in main()."""
+    parsed: int = 0        # distinct listings parsed across all feeds (new + refreshed)
+    new: int = 0
+    refreshed: int = 0
+    detail_fetched: int = 0
+    detail_skipped: int = 0
+
+
+def _force_utf8_stdio() -> None:
+    """Make stdout/stderr tolerate non-ASCII text. Listing titles/descriptions
+    routinely carry emoji and accented characters; on a Windows console the
+    default code page (cp1252) would otherwise raise UnicodeEncodeError and abort
+    the whole run mid-print. No-op where the streams are already UTF-8 (e.g. CI).
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
+def _abort(msg: str, code: int = 2):
+    """Print a loud error and exit non-zero WITHOUT writing any output files.
+
+    Used by the run guards: a broken/partial scrape must leave the previously
+    committed data untouched rather than overwrite it with a bad dataset.
+    """
+    sys.stderr.write(f"\nERROR: {msg}\n")
+    sys.stderr.write("Aborting run: no output files were written; "
+                     "existing data left unchanged.\n")
+    sys.stderr.flush()
+    sys.exit(code)
 
 
 def _fmt_duration(seconds: float) -> str:
@@ -97,7 +139,14 @@ CSV_FIELDS = [
 # ────────────────────────────── persistence ─────────────────────────────────
 
 def load_existing() -> dict[str, Item]:
-    """Load previously-saved items keyed by post_id."""
+    """Load previously-saved items keyed by post_id.
+
+    - File missing        → first run: return {} (the caller logs it).
+    - File present, valid  → the parsed dict.
+    - File present, broken → raise DataLoadError so the caller aborts. We never
+      silently start fresh over a present-but-unreadable cache: the next write
+      would overwrite good data with an empty/near-empty set.
+    """
     if not RAW_PATH.exists():
         return {}
     try:
@@ -110,8 +159,9 @@ def load_existing() -> dict[str, Item]:
                 items[it.key()] = it
         return items
     except Exception as e:
-        print(f"warning: could not load existing data ({e}); starting fresh")
-        return {}
+        raise DataLoadError(
+            f"{RAW_PATH.name} exists but could not be read/parsed: {e}"
+        ) from e
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -204,7 +254,8 @@ def flush_outputs(items: dict[str, Item]) -> None:
 
 # ────────────────────────────── pipeline steps ──────────────────────────────
 
-def do_scrape(existing: dict[str, Item], limit: int | None = None) -> dict[str, Item]:
+def do_scrape(existing: dict[str, Item],
+              limit: int | None = None) -> tuple[dict[str, Item], ScrapeOutcome]:
     """Scrape current listings and merge into the existing dict.
 
     Prices/locations on previously-seen listings are refreshed; AI fields and
@@ -228,9 +279,20 @@ def do_scrape(existing: dict[str, Item], limit: int | None = None) -> dict[str, 
     detail_budget_start = _time.time()
     detail_budget_exceeded = False
 
+    detail_cap = getattr(config, "MAX_NEW_DETAIL_FETCHES_PER_RUN", 0) or 0
+
     def _detail_ok() -> bool:
         nonlocal detail_budget_exceeded
         if detail_budget_exceeded:
+            return False
+        # Per-run count cap: bounds a large recovery so one run stays inside the
+        # job's time budget. Listings past the cap are still recorded (without a
+        # detail page) and get detail-fetched on a later run.
+        if detail_cap > 0 and detail_fetched >= detail_cap:
+            detail_budget_exceeded = True
+            print(f"  ! per-run detail-fetch cap ({detail_cap}) reached; the rest "
+                  f"of this run's new listings are recorded and will be "
+                  f"detail-fetched on later runs")
             return False
         elapsed = _time.time() - detail_budget_start
         if elapsed > config.SCRAPE_DETAIL_PAGE_TIME_BUDGET_SECONDS:
@@ -281,8 +343,10 @@ def do_scrape(existing: dict[str, Item], limit: int | None = None) -> dict[str, 
 
         processed += 1
         if processed % 100 == 0:
-            save_raw(existing)
-            print(f"  …checkpoint at {processed} items processed")
+            # Progress only — no mid-scrape write. Outputs are written once, after
+            # this run passes the guards in main(), so a broken/partial/aborted
+            # scrape can never overwrite the committed data with a bad snapshot.
+            print(f"  …processed {processed} items")
         if limit is not None and processed >= limit:
             print(f"  reached test-mode cap ({limit}); stopping crawl early")
             break
@@ -291,9 +355,16 @@ def do_scrape(existing: dict[str, Item], limit: int | None = None) -> dict[str, 
           f"{len(existing)} total in dataset")
     if config.SCRAPE_ITEM_DETAIL_PAGES:
         print(f"  detail pages fetched: {detail_fetched}"
-              + (f", skipped (budget): {detail_skipped_budget}"
+              + (f", skipped (budget/cap): {detail_skipped_budget}"
                  if detail_skipped_budget else ""))
-    return existing
+    outcome = ScrapeOutcome(
+        parsed=new_count + refresh_count,
+        new=new_count,
+        refreshed=refresh_count,
+        detail_fetched=detail_fetched,
+        detail_skipped=detail_skipped_budget,
+    )
+    return existing, outcome
 
 
 def purge_stale_items(items: dict[str, Item]) -> int:
@@ -713,6 +784,7 @@ def migrate_legacy_for_reenrich(items: dict[str, Item]) -> int:
 
 
 def main():
+    _force_utf8_stdio()
     parser = argparse.ArgumentParser()
     parser.add_argument("--scrape", action="store_true",
                         help="only scrape, don't call AI")
@@ -738,22 +810,23 @@ def main():
         print(f"  (production data is untouched)")
         print("=" * 60)
 
-    items = load_existing()
-    print(f"loaded {len(items)} existing items from {RAW_PATH.name}")
-
-    # Purge stale listings BEFORE scraping so the working set stays small and
-    # the committed JSON stays under GitHub's 100 MB cap. Test mode skips it.
-    if not test_mode:
-        removed = purge_stale_items(items)
-        if removed:
-            print(f"purged {removed} stale items "
-                  f"(>{config.RETENTION_DAYS}d since first seen); "
-                  f"{len(items)} remain")
+    first_run = not RAW_PATH.exists()
+    try:
+        items = load_existing()
+    except DataLoadError as e:
+        # File is present but unreadable: abort rather than start fresh and
+        # overwrite the good data with an empty set.
+        _abort(f"cannot load existing dataset: {e}")
+    loaded_count = len(items)
+    if first_run:
+        print(f"note: {RAW_PATH.name} not found — first run, starting a new dataset")
+    print(f"loaded {loaded_count} existing items from {RAW_PATH.name}")
 
     # One-time migration: items enriched before price_status existed get
     # re-enriched once under the improved price extraction. Only those whose
     # detail page (photo) is already cached are cleared, so they re-enrich this
-    # run rather than getting stuck. Cheap (a few extra batches) and self-clears.
+    # run rather than getting stuck. In-memory only (writes nothing), so it is
+    # safe to run ahead of the guards below.
     migrated = migrate_legacy_for_reenrich(items)
     if migrated:
         print(f"flagged {migrated} legacy items (no price_status) for one-time "
@@ -764,9 +837,56 @@ def main():
 
     if not only_enrich:
         _t0 = time.time()
-        items = do_scrape(items, limit=limit)
-        # Flush all outputs after the scrape phase, so even a run cancelled
-        # before/early in enrichment still commits the freshly-scraped items.
+        items, outcome = do_scrape(items, limit=limit)
+
+        # ── RUN GUARDS ──────────────────────────────────────────────────────
+        # Run BEFORE any output is written, so a failed guard leaves the prior
+        # committed data untouched. (Test mode writes only *_test files, so it
+        # keeps just the zero-parse canary and skips retention/shrink.)
+        if outcome.parsed == 0:
+            _abort("parsed 0 listings across all feeds — the parser or the source "
+                   "changed, or the network failed. Not purging and not writing "
+                   "(previous data left intact).")
+
+        if not test_mode:
+            if outcome.parsed < config.MIN_HEALTHY_PARSED_ITEMS:
+                _abort(f"only {outcome.parsed} listing(s) parsed across all feeds "
+                       f"(< MIN_HEALTHY_PARSED_ITEMS="
+                       f"{config.MIN_HEALTHY_PARSED_ITEMS}) — treating as a "
+                       f"broken/partial run. Not purging and not writing.")
+
+            # Purge stale listings only AFTER a healthy parse (never before —
+            # purging first, then discovering nothing, is what wipes the dataset).
+            removed = purge_stale_items(items)
+            if removed:
+                print(f"purged {removed} stale items "
+                      f"(>{config.RETENTION_DAYS}d since first seen); "
+                      f"{len(items)} remain")
+
+            # Shrink guard: refuse to overwrite the dataset if it lost more than
+            # MAX_DATASET_SHRINK_FRACTION of its items for reasons OTHER than
+            # retention expiry. A healthy parse can legitimately shrink the set a
+            # lot when many old listings age out at once (e.g. the first run after
+            # a long gap) — that portion is expected and allowed; only unexplained
+            # loss (a partial load, a stray delete) trips the guard.
+            final_count = len(items)
+            net_loss = loaded_count - final_count
+            unexplained_loss = max(0, net_loss - removed)
+            max_frac = config.MAX_DATASET_SHRINK_FRACTION
+            if loaded_count and unexplained_loss > max_frac * loaded_count:
+                _abort(f"dataset would shrink from {loaded_count} to {final_count} "
+                       f"and only {removed} of that loss is retention expiry "
+                       f"({unexplained_loss} unexplained > {max_frac:.0%} of "
+                       f"{loaded_count}). Refusing to write.")
+            if loaded_count and net_loss > max_frac * loaded_count:
+                print(f"note: dataset shrank {net_loss}/{loaded_count} "
+                      f"({net_loss / loaded_count:.0%}) — accounted for by {removed} "
+                      f"retention purges on a healthy parse "
+                      f"({outcome.parsed} listings discovered); allowed.")
+
+        # Flush all outputs after the scrape phase (and after the guards pass),
+        # so even a run cancelled before/early in enrichment still commits the
+        # freshly-scraped items.
         recompute_all_flip_scores(items)
         flush_outputs(items)
         scrape_secs = time.time() - _t0

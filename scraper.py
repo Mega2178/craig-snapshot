@@ -53,7 +53,8 @@ DEFAULT_HEADERS = {
 
 @dataclass
 class Item:
-    post_id: str = ""
+    post_id: str = ""          # dedup key: listing token (current URLs) or numeric id (legacy)
+    numeric_post_id: str = ""  # numeric "post id:" read off the detail page, when present
     title: str = ""
     price: str = ""            # raw, e.g. "$1,600"
     price_value: float = 0.0   # parsed numeric (0 = free / unparsed)
@@ -145,9 +146,19 @@ def build_search_url(path: str, offset: int = 0) -> str:
 
 # ────────────────────────────── helpers ─────────────────────────────────────
 
+# Current scheme: ".../view/d/<slug>/<token>". The trailing token (base62-ish,
+# may include '-' and '_') is the stable per-listing key.
+_POST_TOKEN_RE = re.compile(
+    r"/view/[a-z]/[^/]+/([A-Za-z0-9_-]+)/?(?:[?#]|$)", re.IGNORECASE
+)
+# Legacy scheme, still valid on older cached listings: ".../<digits>.html".
 _POST_ID_RE = re.compile(r"/(\d+)\.html(?:[?#]|$)")
+# Numeric "post id:" printed on a listing's own detail page.
+_DETAIL_POST_ID_RE = re.compile(r"post id:\s*(\d+)", re.IGNORECASE)
 _PRICE_RE = re.compile(r"\$\s*([\d,]+(?:\.\d+)?)")
-# The URL section right after the host: ".../spo/d/slug/123.html" → "spo".
+# The URL section right after the host on LEGACY urls: ".../spo/d/slug/123.html"
+# → "spo". The current "/view/d/..." scheme carries no section code, so category
+# is taken from the search feed instead (see _category_from_url).
 _URL_SECTION_RE = re.compile(r"^https?://[^/]+/([a-z]{3})/", re.IGNORECASE)
 
 # Friendly-ish labels for the common URL section codes (the 3-letter segment
@@ -165,9 +176,31 @@ _SECTION_LABELS = {
     "art": "arts+crafts", "bar": "barter", "hab": "household", "tag": "garage sale",
 }
 
+# Friendly labels for the search-feed codes in config.SEARCH_PATHS. Used to label
+# a listing by the feed it was found under, since the current listing-URL scheme
+# no longer carries a per-listing section code.
+_SEARCH_CODE_LABELS = {
+    "sss": "for sale", "tls": "tools", "ele": "electronics", "fuo": "furniture",
+    "app": "appliances", "spo": "sporting", "pho": "photo+video", "jwl": "jewelry",
+    "atq": "antiques", "bik": "bikes", "sys": "computers", "vgm": "video gaming",
+    "msg": "musical", "hvo": "heavy equipment", "pts": "auto parts",
+    "mpo": "motorcycle parts", "mcy": "motorcycles", "wto": "wheels+tires",
+    "tro": "trailers", "grd": "farm+garden", "mat": "materials",
+}
+
 
 def _post_id_from_url(url: str) -> str:
-    m = _POST_ID_RE.search(url or "")
+    """Stable per-listing key from a listing URL.
+
+    Current scheme  ".../view/d/<slug>/<token>"  → the token.
+    Legacy scheme   ".../<digits>.html"           → the digits.
+    Returns "" when neither shape is present.
+    """
+    u = url or ""
+    m = _POST_TOKEN_RE.search(u)
+    if m:
+        return m.group(1)
+    m = _POST_ID_RE.search(u)
     return m.group(1) if m else ""
 
 
@@ -187,14 +220,21 @@ def _parse_price(text: str) -> tuple[str, float]:
 
 
 def _category_from_url(url: str, search_path: str) -> str:
-    """Best-effort human-ish category from the listing URL section code."""
+    """Human-ish category for a listing.
+
+    Legacy listing URLs put the section code right after the host
+    (".../tls/d/..."), read from there when present. The current
+    ".../view/d/..." scheme carries no section code, so we fall back to the feed
+    (search_path) the listing was found under — the crawler always knows which
+    feed it is fetching — mapped to a friendly label. Either way a listing never
+    ends up category-less.
+    """
     m = _URL_SECTION_RE.match(url or "")
     if m:
         code = m.group(1).lower()
         return _SECTION_LABELS.get(code, code)
-    # Fall back to the search path we found it under.
-    tail = (search_path or "").rstrip("/").split("/")[-1]
-    return tail or ""
+    code = (search_path or "").rstrip("/").split("/")[-1].lower()
+    return _SEARCH_CODE_LABELS.get(code, _SECTION_LABELS.get(code, code)) or ""
 
 
 def _first_text(node: Tag, selectors: list[str]) -> str:
@@ -442,5 +482,13 @@ def fetch_item_detail(session: Session, item: Item) -> None:
         item.posted_at = _normalize_iso(times[0].get("datetime", ""))
         if len(times) > 1:
             item.updated_at = _normalize_iso(times[-1].get("datetime", ""))
+
+    # ── Numeric "post id:" (the detail page still prints it even though the
+    #    current listing URL no longer carries it). Stored as an extra field;
+    #    the dedup key stays item.post_id. ──
+    if not item.numeric_post_id:
+        m = _DETAIL_POST_ID_RE.search(html)
+        if m:
+            item.numeric_post_id = m.group(1)
 
     item.description_enriched = True

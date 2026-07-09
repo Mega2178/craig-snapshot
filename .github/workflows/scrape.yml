@@ -95,8 +95,10 @@ jobs:
           retention-days: 7
 
       # ── Commit (production only) ───────────────────────────────────────
+      # success() makes a failed/aborted scrape (non-zero exit) cleanly SKIP this
+      # step, so a broken run commits nothing while the job still shows red.
       - name: Commit and push results
-        if: ${{ env.RUN_MODE == 'production' }}
+        if: ${{ success() && env.RUN_MODE == 'production' }}
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'

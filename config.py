@@ -265,6 +265,34 @@ MAX_LISTING_AGE_DAYS = 60
 PRETTY_PRINT_JSON = False
 
 
+# ─── RUN SAFETY GUARDS ───────────────────────────────────────────────────────
+# The run refuses to overwrite the committed dataset when it looks broken or
+# partial, so a parser break or a mid-run network failure can never silently
+# replace good data with an empty/collapsed snapshot.
+
+# Minimum listings a run must parse across ALL feeds before it may purge stale
+# items or write any output. A healthy run discovers hundreds to thousands (one
+# feed alone serves a few hundred). A run that parses fewer than this is treated
+# as broken/partial: it exits non-zero and writes nothing, leaving the previous
+# data intact for the next run.
+MIN_HEALTHY_PARSED_ITEMS = 25
+
+# Refuse to overwrite the dataset if it would lose more than this fraction of its
+# items for reasons OTHER than normal retention expiry (old listings aging out is
+# expected and does not count toward this). Catches a partial/corrupt load or an
+# unexpected mass-delete before it is committed. 0.20 = 20%.
+MAX_DATASET_SHRINK_FRACTION = 0.20
+
+# Upper bound on how many listing detail pages one run will fetch. The first run
+# after a long gap can discover thousands of new listings at once; at the polite
+# per-request delay, fetching a detail page for every one in a single run could
+# exceed the CI job's time budget. New listings past this cap are still recorded
+# (so they are rediscovered and detail-fetched on later runs) — the backlog just
+# drains over several runs. Set to 0 (or negative) to disable the cap and rely on
+# SCRAPE_DETAIL_PAGE_TIME_BUDGET_SECONDS alone.
+MAX_NEW_DETAIL_FETCHES_PER_RUN = 1500
+
+
 # ─── TEST MODE ───────────────────────────────────────────────────────────────
 # How many items to process when --test is passed. Set to BATCH_SIZE so a test
 # run does exactly ONE Gemini batch end-to-end: scrape ~25 newest listings,
