@@ -297,6 +297,15 @@ html, body {
   color: var(--ink-faint);
   border-color: var(--rule);
 }
+/* "pending" — listing discovered but not yet valued by the AI. Distinct from
+   the greyed "—" (valued but unscoreable) so a fresh card doesn't read as a
+   finished one with a blank score. */
+.badge--score.pending {
+  background: var(--info-soft);
+  color: var(--info);
+  border: 1px solid #cfd9e6;
+  text-transform: lowercase;
+}
 .badge--profit {
   background: var(--info-soft);
   color: var(--info);

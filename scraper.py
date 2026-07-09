@@ -332,17 +332,32 @@ def parse_search_results(html: str, search_path: str) -> list[Item]:
     return items
 
 
-def crawl_all(session: Session) -> Iterator[Item]:
-    """Yield Items from every configured search path, newest first.
+def crawl_all(session: Session, max_items: int | None = None) -> Iterator[Item]:
+    """Yield Items from every configured search path, interleaved round-robin.
 
     Dedupes by post id across paths/pages within this run so the same listing
     that appears in two category feeds is only yielded once.
+
+    Feeds are collected first, then yielded ONE-PER-FEED in rotation (feed 1's
+    newest, feed 2's newest, …, then each feed's second, and so on). The order
+    the caller sees is the order detail pages are fetched, so a per-run
+    detail-fetch budget is spread evenly across every category instead of being
+    spent entirely on the first few feeds — no category is starved when volume
+    exceeds the budget. When nothing caps the run, every parsed item is still
+    yielded, so the resulting dataset is identical to plain feed-order crawling.
+
+    max_items, when set, stops crawling further feeds once that many new
+    listings have been collected — a cheap short-circuit for the --test smoke
+    run so it doesn't fetch all feeds just to process a handful of items.
     """
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     seen: set[str] = set()
     printed = 0
+    per_feed: list[list[Item]] = []
+    collected = 0
 
     for path in config.SEARCH_PATHS:
+        feed_items: list[Item] = []
         for page in range(config.MAX_PAGES_PER_SEARCH):
             offset = config.PAGE_OFFSET_STEP * page
             url = build_search_url(path, offset)
@@ -363,15 +378,29 @@ def crawl_all(session: Session) -> Iterator[Item]:
                     continue
                 seen.add(it.post_id)
                 it.scraped_at = now
+                feed_items.append(it)
                 new_on_page += 1
+                collected += 1
                 if printed < SAMPLE_ITEM_PRINT_LIMIT:
                     _print_sample_item(it)
                     printed += 1
-                yield it
 
             print(f"    parsed {len(page_items)} rows ({new_on_page} new)")
             if new_on_page == 0:
                 break
+
+        per_feed.append(feed_items)
+        if max_items is not None and collected >= max_items:
+            break
+
+    # Round-robin interleave: one item from each feed per rotation, skipping
+    # feeds already exhausted. Preserves every collected item (order only).
+    from itertools import zip_longest
+    _SENTINEL = object()
+    for rotation in zip_longest(*per_feed, fillvalue=_SENTINEL):
+        for it in rotation:
+            if it is not _SENTINEL:
+                yield it
 
 
 def _print_sample_item(it: Item) -> None:

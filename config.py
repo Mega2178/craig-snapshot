@@ -132,11 +132,14 @@ RECHECK_EXISTING_DETAILS = False
 # Max seconds to spend fetching detail pages in one run. Once exceeded, the
 # scraper stops detail-page fetches; the leftover listings get fetched on a
 # subsequent run (they're cached without the detail flag) and enriched then.
-# At ~2s/page this allows roughly 3,000 detail fetches, enough to cover a full
-# ~3,000-item first run when the source isn't throttling. It's a hard ceiling
-# so a blocked/slow run can't blow past the workflow's 240-minute timeout —
-# detail fetching just stops and enrichment proceeds on whatever was fetched.
-SCRAPE_DETAIL_PAGE_TIME_BUDGET_SECONDS = 6500  # ~108 min
+# At ~2s/page this allows roughly 5,700 detail fetches in one run — enough to
+# cover a full re-discovery after a long gap while still leaving time for the
+# enrichment pass to finish inside the workflow timeout. This is the practical
+# governor: on a very large backlog it (not the count cap below) is what bounds
+# the run, so a blocked/slow run can't blow past the job's timeout — detail
+# fetching just stops and enrichment proceeds on whatever was fetched, with the
+# remainder draining over later runs.
+SCRAPE_DETAIL_PAGE_TIME_BUDGET_SECONDS = 12000  # ~200 min
 
 
 # ─── GEMINI ENRICHMENT ───────────────────────────────────────────────────────
@@ -288,9 +291,40 @@ MAX_DATASET_SHRINK_FRACTION = 0.20
 # per-request delay, fetching a detail page for every one in a single run could
 # exceed the CI job's time budget. New listings past this cap are still recorded
 # (so they are rediscovered and detail-fetched on later runs) — the backlog just
-# drains over several runs. Set to 0 (or negative) to disable the cap and rely on
-# SCRAPE_DETAIL_PAGE_TIME_BUDGET_SECONDS alone.
-MAX_NEW_DETAIL_FETCHES_PER_RUN = 1500
+# drains over several runs. The detail budget is spread round-robin across the
+# feeds (see crawl_all), so a cap never starves the later categories. In practice
+# SCRAPE_DETAIL_PAGE_TIME_BUDGET_SECONDS above is reached first on a very large
+# backlog, so this count is a generous safety ceiling rather than the usual
+# limiter. Set to 0 (or negative) to disable the count cap and rely on the time
+# budget alone.
+MAX_NEW_DETAIL_FETCHES_PER_RUN = 7000
+
+
+# ─── DISCOVERY DRIFT ALARM (warn-only) ───────────────────────────────────────
+# A soft, non-aborting check layered on top of the hard guards above. After a
+# healthy run it records a small rolling history of per-run counts and, once
+# enough history exists, warns loudly (a CI ::warning:: annotation) when a run's
+# parsed count collapses far below its recent norm — the degraded-but-nonzero
+# result the hard guards (zero-parse / floor / shrink) don't catch. It never
+# aborts and never blocks a commit; it only flags a run for a human to eyeball.
+
+# Where the rolling per-run history is stored (committed, small). Kept next to
+# the raw cache.
+RUN_STATS_FILENAME = "run_stats.json"
+
+# How many recent runs to retain in that history file.
+RUN_STATS_MAX_ENTRIES = 50
+
+# Minimum number of prior runs required before the drift check does anything, so
+# the first runs on a fresh history never warn.
+DISCOVERY_DRIFT_MIN_HISTORY = 3
+
+# How many trailing runs to take the median over when judging "normal".
+DISCOVERY_DRIFT_MEDIAN_WINDOW = 5
+
+# Warn when this run's parsed count is below this fraction of that trailing
+# median. 0.40 = warn if discovery drops under 40% of the recent norm.
+DISCOVERY_DRIFT_WARN_FRACTION = 0.40
 
 
 # ─── TEST MODE ───────────────────────────────────────────────────────────────

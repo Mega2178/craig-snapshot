@@ -28,7 +28,11 @@ concurrency:
 jobs:
   snapshot:
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    # A large first-run backlog spends a long time on the paced detail-page
+    # fetches plus the enrichment pass; sized from measured run rates with
+    # headroom, and kept under GitHub's 360-minute hard cap. The scraper's own
+    # detail-page time budget (see config.py) stops fetching well before this.
+    timeout-minutes: 345
 
     # Resolve the effective mode once: scheduled runs are always production;
     # a manual run uses the dropdown (which defaults to "test").
@@ -103,6 +107,7 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add raw_items.json items.csv docs/data/items.json
+          git add run_stats.json || true
           if git diff --cached --quiet; then
             echo "No data changes to commit."
           else

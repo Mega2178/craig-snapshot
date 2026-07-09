@@ -303,7 +303,7 @@ def do_scrape(existing: dict[str, Item],
             return False
         return True
 
-    for fresh in crawl_all(session):
+    for fresh in crawl_all(session, max_items=limit):
         key = fresh.key()
         if not key:
             continue
@@ -783,6 +783,69 @@ def migrate_legacy_for_reenrich(items: dict[str, Item]) -> int:
     return n
 
 
+# ─────────────────────────── discovery-drift alarm ──────────────────────────
+
+def _run_stats_path() -> Path:
+    """Where the rolling per-run discovery history lives (committed, small)."""
+    return SCRIPT_DIR / getattr(config, "RUN_STATS_FILENAME", "run_stats.json")
+
+
+def load_run_stats() -> list[dict]:
+    """Load the rolling per-run history. Returns [] when absent or unreadable —
+    the drift alarm is best-effort and must never break a run."""
+    path = _run_stats_path()
+    if not path.exists():
+        return []
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def check_discovery_drift(parsed: int, history: list[dict]) -> None:
+    """Warn (loudly, but WITHOUT aborting) when this run's parsed count has
+    collapsed far below its recent norm — the degraded-but-nonzero case the hard
+    guards don't catch. Emits a GitHub Actions ::warning:: annotation plus a log
+    line and changes nothing else. No-op until enough history has accumulated.
+    """
+    min_history = getattr(config, "DISCOVERY_DRIFT_MIN_HISTORY", 3)
+    window = getattr(config, "DISCOVERY_DRIFT_MEDIAN_WINDOW", 5)
+    frac = getattr(config, "DISCOVERY_DRIFT_WARN_FRACTION", 0.40)
+    recent = [int(e.get("parsed", 0)) for e in history if isinstance(e, dict)]
+    if len(recent) < min_history:
+        return
+    import statistics
+    sample = recent[-window:]
+    median = statistics.median(sample)
+    if median <= 0:
+        return
+    if parsed < frac * median:
+        msg = (f"discovery dropped to {parsed} parsed listings — under "
+               f"{frac:.0%} of the trailing {len(sample)}-run median "
+               f"({median:.0f}). The run still committed (this is a warning, "
+               f"not an abort); check that the feeds/parser are healthy.")
+        # GitHub Actions annotation (surfaces on the run summary) + plain log.
+        print(f"::warning title=Discovery drift::{msg}")
+        print(f"  ⚠ {msg}")
+
+
+def append_run_stats(history: list[dict], entry: dict) -> None:
+    """Append this run's stats to the rolling history, trim to the most recent
+    RUN_STATS_MAX_ENTRIES, and write it back atomically. Best-effort: a write
+    failure is logged and swallowed so it can't fail an otherwise-good run."""
+    max_entries = getattr(config, "RUN_STATS_MAX_ENTRIES", 50)
+    updated = list(history) + [entry]
+    if len(updated) > max_entries:
+        updated = updated[-max_entries:]
+    try:
+        _atomic_write_text(_run_stats_path(),
+                           json.dumps(updated, separators=(",", ":")))
+    except Exception as e:
+        print(f"  ! could not write run stats: {e}")
+
+
 def main():
     _force_utf8_stdio()
     parser = argparse.ArgumentParser()
@@ -834,6 +897,8 @@ def main():
 
     scrape_secs = None
     enrich_secs = None
+    outcome = None
+    run_history: list | None = None  # set on a healthy production scrape
 
     if not only_enrich:
         _t0 = time.time()
@@ -884,6 +949,13 @@ def main():
                       f"retention purges on a healthy parse "
                       f"({outcome.parsed} listings discovered); allowed.")
 
+            # Soft drift alarm (warn-only): a loud CI annotation if discovery has
+            # collapsed far below its recent norm. Never aborts — the hard guards
+            # above stay the abort layer. Stats for this run are recorded at the
+            # end (once the enrichment count is known).
+            run_history = load_run_stats()
+            check_discovery_drift(outcome.parsed, run_history)
+
         # Flush all outputs after the scrape phase (and after the guards pass),
         # so even a run cancelled before/early in enrichment still commits the
         # freshly-scraped items.
@@ -901,6 +973,19 @@ def main():
     # always recompute flip scores + cost basis at end (prices may have refreshed)
     recompute_all_flip_scores(items)
     flush_outputs(items)
+
+    # Record this run's discovery stats for the drift alarm. Production scrapes
+    # only: run_history is set only after the healthy-parse guards pass in a
+    # non-test scrape, so test runs and enrich-only runs never touch the
+    # committed history.
+    if run_history is not None and outcome is not None:
+        append_run_stats(run_history, {
+            "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            "parsed": outcome.parsed,
+            "new": outcome.new,
+            "fetched": outcome.detail_fetched,
+            "enriched": sum(1 for it in items.values() if it.ai_confidence),
+        })
 
     # summary
     enriched = sum(1 for it in items.values() if it.ai_confidence)

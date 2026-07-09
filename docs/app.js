@@ -15,7 +15,10 @@
 
   const PAGE_SIZE = 60;                  // cards rendered per "page"
   const STATE_KEY = "market-snapshot:ui-state";
-  const STATE_VERSION = 1;
+  // Bump to discard any persisted UI state from an older version — e.g. a saved
+  // Min-ROI value from before the default changed, which would otherwise mask
+  // the new default and keep unscored items hidden for returning visitors.
+  const STATE_VERSION = 2;
 
   // ─── Smart-score weights ────────────────────────────────────────
   // Smart score = w_roi*ROI_norm + w_profit*profit_norm + w_velocity*velocity_norm
@@ -708,9 +711,20 @@
     const scoreEl = node.querySelector('[data-role="flip-score"]');
     const f = flipScoreOf(item);
     if (isNaN(f)) {
-      scoreEl.textContent = "—";
-      scoreEl.classList.add("empty");
-      scoreEl.title = "No flip score (AI confidence: unknown)";
+      // Distinguish "not valued yet" (no AI confidence at all) from "valued but
+      // unscoreable" (confidence unknown / untrusted price). The former is a
+      // transient state while enrichment catches up, so badge it "pending"
+      // rather than letting it look like a finished card with a blank score.
+      if (!item.ai_confidence) {
+        scoreEl.textContent = "pending";
+        scoreEl.classList.add("pending");
+        scoreEl.title = "Pending valuation — not yet valued by the AI; " +
+          "it will be scored on an upcoming run.";
+      } else {
+        scoreEl.textContent = "—";
+        scoreEl.classList.add("empty");
+        scoreEl.title = "No flip score (AI confidence: unknown)";
+      }
     } else {
       scoreEl.textContent = f.toFixed(2) + "×";
       scoreEl.title =
