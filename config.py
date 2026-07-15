@@ -109,6 +109,68 @@ MAX_PAGES_PER_SEARCH = 1
 PAGE_OFFSET_STEP = 120
 
 
+# ─── DISCOVERY (primary) ─────────────────────────────────────────────────────
+# Discovery no longer relies on the shallow no-JS result pages above (which only
+# ever serve the newest few hundred rows per path). Instead we enumerate the
+# metro's live for-sale inventory through the site's own results API, which
+# returns the full set in a handful of requests. The SEARCH_PATHS/MAX_PAGES knobs
+# above are retained only for the legacy path in scraper.py (not used by default).
+#
+# AREA ID: the API addresses a metro by a numeric area id, NOT the subdomain
+# string. kansascity = 30. If you point SITE_SUBDOMAIN at another metro, set the
+# matching id here (read it off the "batch=<id>-..." request the site issues in a
+# browser's Network tab).
+DISCOVERY_AREA_ID = 30
+DISCOVERY_ENDPOINT = "https://sapi.craigslist.org/web/v8/postings/search/full"
+DISCOVERY_SEARCH_PATH = "sss"   # the whole for-sale section (every for-sale category)
+
+# The API serves at most 10,000 rows per query, so a single "everything" pull
+# would top out at 10k of ~25k. We defeat that by pulling complete price slices
+# (each slice is well under 10k, so every priced listing in it comes back) plus
+# one newest-first pull to pick up listings that carry no price (they fall in no
+# slice). Each (min, max) is inclusive; max=None means "no upper bound". If a
+# slice ever approaches 10k (logged as a warning), split it further.
+DISCOVERY_PRICE_SLICES = [(0, 25), (26, 100), (101, 500), (501, 2500), (2501, None)]
+DISCOVERY_NEWEST_PASS = True
+# The API ignores an oldest-first sort and won't page past row 10,000, so a
+# listing with NO price whose last renewal is older than the newest-10k window is
+# not reachable (a small, unscoreable residual — priced listings are unaffected,
+# the slices catch them all regardless of renewal age).
+
+# Category ids to EXCLUDE from discovery. Everything else in the for-sale section
+# stays in scope (including free/no-price listings, parts, motorcycles). Ids are
+# the site's own category codes — tweak freely.
+#   • Every "by dealer" category (dealer listings are excluded entirely)
+#   • Boats: 119 (by owner); 164 (by dealer) is already in the dealer set
+#   • Cars & trucks: 145 (by owner); 146 (by dealer) is already in the dealer set
+DISCOVERY_EXCLUDED_CATEGORY_IDS = {
+    # "by dealer" categories
+    142, 146, 160, 161, 162, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172,
+    173, 174, 175, 176, 177, 178, 179, 180, 181, 182, 183, 184, 185, 186, 187,
+    188, 189, 190, 192, 194, 196, 198, 200, 202, 204, 206, 209,
+    # boats (by owner) and cars & trucks (by owner)
+    119, 145,
+}
+
+# Abort the run (before any purge/write) if the section reports fewer than this
+# many total listings — a floor that catches the API/section breaking or a soft
+# block, rather than quietly discovering almost nothing. Normal is ~25,000.
+MIN_CENSUS_TOTAL = 5000
+
+# Safety margin (days) added to the retention window when pre-filtering discovery
+# candidates by their estimated original post date. Candidates estimated older
+# than RETENTION_DAYS + this are skipped (not detail-fetched); the exact post date
+# from the detail page still governs the final keep/drop, so the margin only
+# guards against interpolation error at the boundary.
+DISCOVERY_POST_DATE_MARGIN_DAYS = 2
+
+# Escape hatch: set True to use the legacy no-JS feed crawl (SEARCH_PATHS above)
+# instead of the results-API enumeration. Off by default and never selected
+# automatically — a discovery failure aborts the run rather than silently
+# reverting to the shallower crawl.
+LEGACY_FEED_DISCOVERY = False
+
+
 # ─── BEHAVIOR ────────────────────────────────────────────────────────────────
 # Seconds between HTTP requests to the source. Be polite — this site is much
 # more aggressive about blocking scrapers than the auction site this tool was
@@ -244,11 +306,13 @@ SALES_VELOCITY_SCORES = {
 
 
 # ─── DATA RETENTION ──────────────────────────────────────────────────────────
-# How many days to keep a listing in the dataset after WE FIRST SAW IT.
-# Classifieds listings run ~30-45 days, so 30 is a sensible default. Drop it to
-# keep the dashboard focused on fresh listings; raise it to keep a longer
-# history. Setting this very high grows the repo over time (GitHub's hard limit
-# is 100 MB per file).
+# How many days to keep a listing, measured from its ORIGINAL post date (the
+# exact date read off the detail page). A listing renewed/bumped to look fresh
+# but originally posted longer ago than this is dropped — the window tracks the
+# real post date, not the renewal. Listings with no readable post date yet (e.g.
+# recorded but not detail-fetched) fall back to when WE first saw them, so they
+# survive to be detail-fetched on a later run rather than being dropped blind.
+# Classifieds listings run ~30-45 days, so 30 keeps the set to the fresh window.
 RETENTION_DAYS = 30
 
 # Skip listings POSTED more than this many days ago: don't enrich them and don't

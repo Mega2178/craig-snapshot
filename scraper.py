@@ -2,24 +2,27 @@
 Scraper for a public classifieds source. No browser needed — just requests + bs4.
 
 Two phases:
-  1. crawl_all(session)         → yields Item objects parsed from the newest
-                                   search-results listings (title, price,
-                                   location, URL, post id).
+  1. crawl_all(session, existing) → enumerates the metro's live for-sale
+                                   listings through the site's results API
+                                   (complete price slices + a newest pass) and
+                                   yields the in-scope, in-window ones as Items
+                                   (title, price, URL, category, post ids).
   2. fetch_item_detail(session, item) → fetches one listing's own page and
                                    fills in the full description, photo URLs,
-                                   and posted/updated timestamps.
+                                   location, and posted/updated timestamps.
 
-The site serves a plain, no-JavaScript fallback list of results inside
-<ol class="cl-static-search-results">. We parse THAT (rather than the gallery
-markup that loads via JS), because it carries the one thing we need that the
-JSON-LD blob on the same page omits: the per-listing URL. Selectors are written
-defensively with fallbacks; if the site changes its markup, the spots to adjust
-are parse_search_results() and fetch_item_detail().
+A legacy crawler that parses the no-JS search-results pages
+(<ol class="cl-static-search-results">) is kept behind
+config.LEGACY_FEED_DISCOVERY for manual use; it only ever sees the newest few
+hundred rows per feed. If the site changes markup/format, the spots to adjust
+are _decode_discovery_item(), parse_search_results(), and fetch_item_detail().
 """
 from __future__ import annotations
 
+import bisect
 import json
 import re
+import statistics
 import time
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
@@ -32,6 +35,35 @@ from bs4 import BeautifulSoup, Tag
 import config
 
 BASE_URL = f"https://{config.SITE_SUBDOMAIN}.craigslist.org"
+
+
+class DiscoveryError(Exception):
+    """Discovery could not enumerate the source (endpoint down, response shape
+    changed, or an implausibly small result set). Raised so the caller aborts the
+    run BEFORE any purge/write — never silently falling back to a partial set."""
+
+
+# Numeric section id → short human label, for the `category` display field. Only
+# the for-sale sections appear via discovery; unknown ids fall through to the id.
+_CATEGORY_LABELS = {
+    5: "general for sale", 7: "computers", 20: "wanted", 42: "barter",
+    44: "tickets", 68: "bicycles", 69: "motorcycles", 73: "garage sale",
+    92: "books", 93: "sporting goods", 94: "clothing", 95: "collectibles",
+    96: "electronics", 97: "household", 98: "musical instruments",
+    101: "free stuff", 107: "baby & kid", 117: "cds / dvds", 118: "tools",
+    119: "boats", 120: "jewelry", 122: "auto parts", 124: "rvs",
+    132: "toys & games", 133: "farm & garden", 134: "business/commercial",
+    135: "arts & crafts", 136: "materials", 137: "photo/video", 141: "furniture",
+    145: "cars & trucks", 149: "appliances", 150: "antiques", 151: "video gaming",
+    152: "health & beauty", 153: "cell phones", 191: "atvs/utvs/snowmobiles",
+    193: "heavy equipment", 195: "motorcycle parts", 197: "bicycle parts",
+    199: "computer parts", 201: "boat parts", 203: "wheels & tires",
+    205: "trailers", 208: "aviation",
+}
+
+
+def _category_label(category_id: int) -> str:
+    return _CATEGORY_LABELS.get(category_id, str(category_id))
 
 # How many "sample" scraped items to echo to the log across the ENTIRE run, so
 # you can eyeball that the scraper is pulling real titles/prices and not empty
@@ -61,7 +93,8 @@ class Item:
     image_url: str = ""        # primary photo (filled from the detail page)
     image_urls: list = field(default_factory=list)  # up to MAX_IMAGES_PER_ITEM
     item_url: str = ""
-    category: str = ""         # human-ish label derived from the URL section
+    category: str = ""         # human-ish label (from the section code the listing sits in)
+    category_id: str = ""      # numeric section id from discovery (stable, for filtering)
     location: str = ""         # neighborhood / city text the seller entered
     description: str = ""      # full freeform body (from the detail page)
     posted_at: str = ""        # ISO, when the seller posted (detail page)
@@ -106,7 +139,8 @@ class Session:
         self.delay = delay
         self.last_request = 0.0
 
-    def get(self, url: str, retries: int = 3) -> str:
+    def get(self, url: str, retries: int = 3,
+            headers: dict | None = None, timeout: int = 30) -> str:
         elapsed = time.time() - self.last_request
         if elapsed < self.delay:
             time.sleep(self.delay - elapsed)
@@ -114,7 +148,7 @@ class Session:
         last_err: Exception | None = None
         for attempt in range(retries):
             try:
-                r = self.session.get(url, timeout=30)
+                r = self.session.get(url, timeout=timeout, headers=headers)
                 self.last_request = time.time()
                 if r.status_code == 200:
                     return r.text
@@ -332,23 +366,14 @@ def parse_search_results(html: str, search_path: str) -> list[Item]:
     return items
 
 
-def crawl_all(session: Session, max_items: int | None = None) -> Iterator[Item]:
-    """Yield Items from every configured search path, interleaved round-robin.
+# ── legacy feed crawl (dormant; enable via config.LEGACY_FEED_DISCOVERY) ─────
 
-    Dedupes by post id across paths/pages within this run so the same listing
-    that appears in two category feeds is only yielded once.
-
-    Feeds are collected first, then yielded ONE-PER-FEED in rotation (feed 1's
-    newest, feed 2's newest, …, then each feed's second, and so on). The order
-    the caller sees is the order detail pages are fetched, so a per-run
-    detail-fetch budget is spread evenly across every category instead of being
-    spent entirely on the first few feeds — no category is starved when volume
-    exceeds the budget. When nothing caps the run, every parsed item is still
-    yielded, so the resulting dataset is identical to plain feed-order crawling.
-
-    max_items, when set, stops crawling further feeds once that many new
-    listings have been collected — a cheap short-circuit for the --test smoke
-    run so it doesn't fetch all feeds just to process a handful of items.
+def _legacy_feed_crawl(session: Session, max_items: int | None = None) -> Iterator[Item]:
+    """The previous discovery path: parse the no-JS result pages of each
+    configured search path, round-robin interleaved. Superseded by the results-API
+    enumeration in crawl_all (which reaches the whole section, not just the newest
+    few hundred per path). Retained for manual use only — never used as an
+    automatic fallback. Set config.LEGACY_FEED_DISCOVERY = True to select it.
     """
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     seen: set[str] = set()
@@ -393,14 +418,266 @@ def crawl_all(session: Session, max_items: int | None = None) -> Iterator[Item]:
         if max_items is not None and collected >= max_items:
             break
 
-    # Round-robin interleave: one item from each feed per rotation, skipping
-    # feeds already exhausted. Preserves every collected item (order only).
     from itertools import zip_longest
     _SENTINEL = object()
     for rotation in zip_longest(*per_feed, fillvalue=_SENTINEL):
         for it in rotation:
             if it is not _SENTINEL:
                 yield it
+
+
+# ── original-post-date estimate from the id→date curve ──────────────────────
+
+def _build_post_date_estimator(existing: dict):
+    """Build est(numeric_id) → original-post timestamp from cached anchor pairs.
+
+    Listing numeric ids are globally sequential, so a listing's original post
+    date interpolates cleanly from the (numeric_id, posted_at) pairs we already
+    hold. Used only to PRE-FILTER discovery candidates by age (skip clearly-old
+    ones before spending a detail fetch); the exact detail-page date still
+    governs the final keep/drop. Returns None when there are too few anchors.
+    """
+    pairs = []
+    for it in existing.values():
+        nid = (getattr(it, "numeric_post_id", "") or "")
+        pa = (getattr(it, "posted_at", "") or "")
+        if nid.isdigit() and pa:
+            try:
+                pairs.append((int(nid),
+                              datetime.fromisoformat(pa.replace("Z", "+00:00")).timestamp()))
+            except ValueError:
+                continue
+    if len(pairs) < 50:
+        return None
+    pairs.sort()
+    ts = [p[1] for p in pairs]
+    knot_ids, knot_ts = [], []
+    for i in range(0, len(pairs), 10):  # rolling-median knots, robust to outliers
+        lo, hi = max(0, i - 25), min(len(pairs), i + 26)
+        knot_ids.append(pairs[i][0])
+        knot_ts.append(statistics.median(ts[lo:hi]))
+
+    def est(nid: int) -> float:
+        i = bisect.bisect_left(knot_ids, nid)
+        if i <= 0:
+            return knot_ts[0]
+        if i >= len(knot_ids):
+            return knot_ts[-1]
+        x0, x1, y0, y1 = knot_ids[i - 1], knot_ids[i], knot_ts[i - 1], knot_ts[i]
+        return y0 if x1 == x0 else y0 + (y1 - y0) * (nid - x0) / (x1 - x0)
+
+    return est
+
+
+# ── results-API discovery ────────────────────────────────────────────────────
+
+_DISCOVERY_TOKEN_CODE = 13   # sub-element [13, "<token>"] carries the listing token
+_DISCOVERY_SLUG_CODE = 6     # sub-element [6, "<slug>"] carries the URL slug
+
+
+def _discovery_headers() -> dict:
+    sp = getattr(config, "DISCOVERY_SEARCH_PATH", "sss")
+    return {
+        "User-Agent": DEFAULT_HEADERS["User-Agent"],
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": f"https://www.craigslist.org/search/area/{config.SITE_SUBDOMAIN}?cat={sp}",
+        "Origin": "https://www.craigslist.org",
+    }
+
+
+def _decode_discovery_item(item: list, decode: dict):
+    """Decode one compact-with-detail row → (nid, catid, price, token, slug, title).
+
+    Layout: [id_offset, date_offset, category_id, price, geo, code, …sub-lists…,
+    title]; sub-lists [13,token] and [6,slug] carry the listing token and URL
+    slug. Returns None if the row can't be decoded (e.g. no token → unreachable).
+    """
+    try:
+        nid = decode["minPostingId"] + item[0]
+        catid = item[2]
+        price = item[3]
+    except (KeyError, IndexError, TypeError):
+        return None
+    token = slug = None
+    for el in item:
+        if isinstance(el, list) and el:
+            if el[0] == _DISCOVERY_TOKEN_CODE:
+                token = el[1]
+            elif el[0] == _DISCOVERY_SLUG_CODE:
+                slug = el[1]
+    title = item[-1] if (item and isinstance(item[-1], str)) else ""
+    return nid, catid, price, token, slug, title
+
+
+def _fetch_discovery_slice(session: Session, area: int, label: str,
+                           price_slice: tuple | None):
+    """Fetch one results-API slice; return (items, decode, total_reported).
+
+    Raises DiscoveryError on any transport/shape failure so the run aborts before
+    writing rather than proceeding on a partial set.
+    """
+    endpoint = getattr(config, "DISCOVERY_ENDPOINT",
+                       "https://sapi.craigslist.org/web/v8/postings/search/full")
+    sp = getattr(config, "DISCOVERY_SEARCH_PATH", "sss")
+    params = f"batch={area}-0-10000-1-0&cc=US&lang=en&searchPath={sp}"
+    if price_slice is not None:
+        lo, hi = price_slice
+        params += f"&min_price={lo}"
+        if hi is not None:
+            params += f"&max_price={hi}"
+    url = f"{endpoint}?{params}"
+    try:
+        # Full-format responses run to ~10 MB; a flaky connection can cut one
+        # mid-body. Retry a little harder than a page fetch (these are only ~6
+        # requests per run and each retry is cheap next to aborting the run).
+        text = session.get(url, retries=4, headers=_discovery_headers(), timeout=120)
+        payload = json.loads(text)
+        data = payload["data"]
+        items = data["items"]
+        decode = data["decode"]
+    except Exception as e:
+        raise DiscoveryError(f"{label}: {e}") from e
+    return items, decode, data.get("totalResultCount")
+
+
+def crawl_all(session: Session, existing: dict | None = None,
+              max_items: int | None = None) -> Iterator[Item]:
+    """Enumerate the metro's live for-sale listings via the results API and yield
+    the in-scope, in-window ones as Items (keyed by listing token, exactly like
+    the legacy feed crawl so the rest of the pipeline is unchanged).
+
+    Volume comes from enumeration, not feed breadth: complete price slices plus a
+    newest-first pass return essentially the whole for-sale section in ~6 requests
+    (each row already carries its token, so no extra lookup). Out-of-scope
+    categories (see config.DISCOVERY_EXCLUDED_CATEGORY_IDS) are dropped, and
+    candidates whose estimated original post date is older than the retention
+    window (plus a safety margin) are skipped so a detail fetch isn't spent on
+    them — the exact post date from the detail page makes the final call.
+
+    On any source failure — endpoint down, response shape changed, or an
+    implausibly small result set — raises DiscoveryError so the caller aborts
+    before purge/write. There is deliberately NO fallback to the legacy crawl.
+
+    max_items (test smoke) fetches only the newest pass and yields that many.
+    """
+    if getattr(config, "LEGACY_FEED_DISCOVERY", False):
+        print("  discovery: LEGACY_FEED_DISCOVERY on — using the no-JS feed crawl")
+        yield from _legacy_feed_crawl(session, max_items=max_items)
+        return
+
+    existing = existing or {}
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    area = getattr(config, "DISCOVERY_AREA_ID", 30)
+    excluded = set(getattr(config, "DISCOVERY_EXCLUDED_CATEGORY_IDS", ()))
+    test_mode = max_items is not None
+
+    print("\n  discovery: enumerating the for-sale section via the results API")
+    slices: list[tuple[str, tuple | None]] = []
+    if test_mode:
+        slices.append(("newest (test)", None))
+    else:
+        for lo, hi in getattr(config, "DISCOVERY_PRICE_SLICES", []):
+            slices.append((f"price ${lo}-{hi if hi is not None else 'up'}", (lo, hi)))
+        if getattr(config, "DISCOVERY_NEWEST_PASS", True):
+            slices.append(("newest", None))
+
+    census: dict[int, tuple] = {}   # nid -> (catid, price, token, slug, title)
+    section_total = 0
+    for label, price_slice in slices:
+        items, decode, total = _fetch_discovery_slice(session, area, label, price_slice)
+        section_total = max(section_total, total or 0)
+        n_new = n_tok = 0
+        for item in items:
+            row = _decode_discovery_item(item, decode)
+            if row is None:
+                continue
+            nid, catid, price, token, slug, title = row
+            if token:
+                n_tok += 1
+            if nid not in census:
+                census[nid] = (catid, price, token, slug, title)
+                n_new += 1
+        print(f"    {label}: {len(items)} rows (section total={total}), "
+              f"{n_new} new → {len(census)} enumerated")
+        # Token-presence guard: the full format carries a token on every row. A
+        # response missing them means the format changed → abort, don't ingest.
+        if items and n_tok < 0.5 * len(items):
+            raise DiscoveryError(
+                f"{label}: only {n_tok}/{len(items)} rows carried a listing token "
+                f"— results format changed")
+        if price_slice is not None and (total or 0) >= 10000:
+            print(f"    ! WARNING: slice {label!r} reports {total} rows (>=10000 cap); "
+                  f"some may be unreachable — split this price slice in config")
+
+    # Format-break / block canary: the section normally reports ~25k listings.
+    if not test_mode:
+        floor = getattr(config, "MIN_CENSUS_TOTAL", 5000)
+        if section_total < floor or len(census) < floor:
+            raise DiscoveryError(
+                f"section reported {section_total} listings / {len(census)} enumerated "
+                f"(< {floor}) — source is broken or blocking; refusing to continue")
+
+    # Window pre-filter: skip candidates estimated older than the retention window.
+    est = _build_post_date_estimator(existing)
+    known_posted: dict[int, float] = {}
+    for it in existing.values():
+        nid = (getattr(it, "numeric_post_id", "") or "")
+        pa = (getattr(it, "posted_at", "") or "")
+        if nid.isdigit() and pa:
+            try:
+                known_posted[int(nid)] = datetime.fromisoformat(
+                    pa.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                pass
+    retention_days = getattr(config, "RETENTION_DAYS", 30)
+    margin = getattr(config, "DISCOVERY_POST_DATE_MARGIN_DAYS", 2)
+    cutoff_ts = None
+    if est is not None and retention_days >= 0:
+        cutoff_ts = datetime.now(timezone.utc).timestamp() - (retention_days + margin) * 86400
+
+    candidates = []
+    n_excluded = n_old = 0
+    for nid, (catid, price, token, slug, title) in census.items():
+        if catid in excluded:
+            n_excluded += 1
+            continue
+        if not token:
+            continue
+        if cutoff_ts is not None:
+            post_ts = known_posted.get(nid) or est(nid)
+            if post_ts < cutoff_ts:
+                n_old += 1
+                continue
+        candidates.append((nid, catid, price, token, slug, title))
+
+    # Newest post first, so a capped detail budget always covers the freshest.
+    candidates.sort(key=lambda c: c[0], reverse=True)
+    print(f"  discovery: {len(census)} enumerated → {len(candidates)} in-scope in-window "
+          f"({n_excluded} excluded-category, {n_old} out-of-window skipped)")
+
+    printed = 0
+    yielded = 0
+    for nid, catid, price, token, slug, title in candidates:
+        it = Item(
+            post_id=token,
+            numeric_post_id=str(nid),
+            title=title or "",
+            item_url=f"https://www.craigslist.org/view/d/{slug or 'x'}/{token}",
+            category=_category_label(catid),
+            category_id=str(catid),
+        )
+        if isinstance(price, (int, float)) and price > 0:
+            it.price = f"${int(price):,}"
+            it.price_value = float(price)
+        it.scraped_at = now
+        if printed < SAMPLE_ITEM_PRINT_LIMIT:
+            _print_sample_item(it)
+            printed += 1
+        yield it
+        yielded += 1
+        if max_items is not None and yielded >= max_items:
+            return
 
 
 def _print_sample_item(it: Item) -> None:
@@ -504,6 +781,24 @@ def fetch_item_detail(session: Session, item: Item) -> None:
             raw, val = _parse_price(f"${price}")
             if val:
                 item.price, item.price_value = raw, val
+
+    # ── Location: the place text shown in parens after the title (results-API
+    #    discovery carries only coordinates, not this text). Current markup is a
+    #    plain "(City, ST)" span inside .postingtitletext (a .price span may sit
+    #    between it and the title); older pages used <small>. Fall back to the
+    #    geo.placename meta when the title carries no location. ──
+    if not item.location:
+        holder = soup.select_one(".postingtitletext")
+        if holder:
+            for sp in holder.find_all(["span", "small"]):
+                t = sp.get_text(" ", strip=True)
+                if len(t) >= 3 and t.startswith("(") and t.endswith(")"):
+                    item.location = t.strip("()").strip()
+                    break
+        if not item.location:
+            meta = soup.select_one('meta[name="geo.placename"]')
+            if meta and meta.get("content"):
+                item.location = str(meta["content"]).strip()
 
     # ── Posted / updated timestamps. ──
     times = soup.select(".postinginfos time[datetime], time.timeago[datetime]")

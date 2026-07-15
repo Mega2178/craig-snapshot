@@ -26,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import config
-from scraper import Item, Session, crawl_all
+from scraper import Item, Session, crawl_all, DiscoveryError
 
 
 class DataLoadError(Exception):
@@ -303,7 +303,7 @@ def do_scrape(existing: dict[str, Item],
             return False
         return True
 
-    for fresh in crawl_all(session, max_items=limit):
+    for fresh in crawl_all(session, existing=existing, max_items=limit):
         key = fresh.key()
         if not key:
             continue
@@ -368,11 +368,19 @@ def do_scrape(existing: dict[str, Item],
 
 
 def purge_stale_items(items: dict[str, Item]) -> int:
-    """Drop listings first seen more than RETENTION_DAYS ago.
+    """Drop listings whose ORIGINAL post date is older than RETENTION_DAYS.
 
-    Classifieds listings expire on their own after ~30-45 days; this keeps the
-    dataset (and the committed JSON) from growing without bound. Items with no
-    parseable first_seen_at are kept (we can't judge their age).
+    Age is measured from the listing's own posted_at (the exact detail-page date),
+    so a listing renewed/bumped to look fresh but posted long ago is dropped on its
+    true age — the window tracks the real post date, not the renewal. Listings with
+    no readable posted_at yet (e.g. discovered this run but not yet detail-fetched)
+    fall back to first_seen_at, so they survive to be fetched on a later run rather
+    than being dropped blind. Items with neither date are kept.
+
+    This is also the posted-window ingest gate: a freshly-added item whose true
+    posted_at is already older than the window is removed here — before enrichment
+    and scoring — in the same pass, and counted as retention-explained loss by the
+    run's shrink guard.
 
     Returns the number of items removed.
     """
@@ -381,15 +389,22 @@ def purge_stale_items(items: dict[str, Item]) -> int:
         return 0  # negative = no purging
     cutoff = datetime.now(timezone.utc) - timedelta(days=keep_days)
 
+    def _age_basis(it: Item):
+        # Prefer the true post date; fall back to when we first saw it.
+        for raw in (it.posted_at, it.first_seen_at):
+            if not raw:
+                continue
+            try:
+                d = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                continue
+            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        return None
+
     to_drop = []
     for key, it in items.items():
-        if not it.first_seen_at:
-            continue
-        try:
-            seen = datetime.fromisoformat(it.first_seen_at.replace("Z", "+00:00"))
-        except (ValueError, TypeError):
-            continue
-        if seen < cutoff:
+        basis = _age_basis(it)
+        if basis is not None and basis < cutoff:
             to_drop.append(key)
 
     for key in to_drop:
@@ -902,7 +917,13 @@ def main():
 
     if not only_enrich:
         _t0 = time.time()
-        items, outcome = do_scrape(items, limit=limit)
+        try:
+            items, outcome = do_scrape(items, limit=limit)
+        except DiscoveryError as e:
+            # Source enumeration failed (endpoint down, format changed, or an
+            # implausibly small result set). Abort before any purge/write so the
+            # previous committed data is left intact — never silently continue.
+            _abort(f"discovery failed: {e}")
 
         # ── RUN GUARDS ──────────────────────────────────────────────────────
         # Run BEFORE any output is written, so a failed guard leaves the prior
@@ -925,7 +946,7 @@ def main():
             removed = purge_stale_items(items)
             if removed:
                 print(f"purged {removed} stale items "
-                      f"(>{config.RETENTION_DAYS}d since first seen); "
+                      f"(posted >{config.RETENTION_DAYS}d ago; first-seen fallback); "
                       f"{len(items)} remain")
 
             # Shrink guard: refuse to overwrite the dataset if it lost more than
